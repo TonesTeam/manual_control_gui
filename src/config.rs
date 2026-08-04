@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 pub const SELECTOR_8_MAX: u16 = 8;
 pub const SELECTOR_16_MAX: u16 = 16;
+pub const MAIN_PUMP_MAX: u16 = 3810;
+pub const SECONDARY_PUMP_MAX: u16 = 12000;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Settings {

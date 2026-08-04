@@ -8,12 +8,18 @@ pub struct PumpController {
     baudrate: u32,
     slave_address: u8,
     has_solenoids: bool,
+    max_pos: u16,
 }
 
 const SYR_SWAP_DELAY: u64 = 750; // Delay in milliseconds for syringe swap
 
 impl PumpController {
-    pub fn new(port_name: String, baud_rate: u32, slave_address: u8) -> Result<Self, String> {
+    pub fn new(
+        port_name: String,
+        baud_rate: u32,
+        slave_address: u8,
+        max_pos: u16,
+    ) -> Result<Self, String> {
         if port_name.is_empty() {
             return Err("Port name cannot be empty".to_string());
         }
@@ -26,6 +32,7 @@ impl PumpController {
             baudrate: baud_rate,
             slave_address,
             has_solenoids: false,
+            max_pos,
         })
     }
 
@@ -37,6 +44,10 @@ impl PumpController {
 
     pub fn has_solenoids(&self) -> bool {
         self.has_solenoids
+    }
+
+    pub fn max_pos(&self) -> u16 {
+        self.max_pos
     }
 
     pub fn get_pos(&self) -> Result<u16, String> {
@@ -87,8 +98,8 @@ impl PumpController {
     }
 
     pub fn set_pos(&self, pos: u16) -> Result<(), String> {
-        if !(0..=3810).contains(&pos) {
-            return Err("Position must be between 0 and 3810".to_string());
+        if !(0..=self.max_pos).contains(&pos) {
+            return Err(format!("Position must be between 0 and {}", self.max_pos));
         }
         let current = self.get_pos()?;
         let adjustment = pos as i16 - current as i16;
@@ -102,8 +113,8 @@ impl PumpController {
     }
 
     pub fn increase_pos_by(&self, pos: u16) -> Result<(), String> {
-        if !(0..=3810).contains(&pos) {
-            return Err("Position must be between 0 and 3810".to_string());
+        if !(0..=self.max_pos).contains(&pos) {
+            return Err(format!("Position must be between 0 and {}", self.max_pos));
         }
         let command_args = decimal_to_2byte_hex(pos);
         let command = [
@@ -119,8 +130,8 @@ impl PumpController {
     }
 
     pub fn decrease_pos_by(&self, pos: u16) -> Result<(), String> {
-        if !(0..=3810).contains(&pos) {
-            return Err("Position must be between 0 and 3810".to_string());
+        if !(0..=self.max_pos).contains(&pos) {
+            return Err(format!("Position must be between 0 and {}", self.max_pos));
         }
         let command_args = decimal_to_2byte_hex(pos);
         let command = [
@@ -191,8 +202,8 @@ impl PumpController {
     }
 
     pub fn set_pos_autostop(&self, pos: u16) -> Result<(), String> {
-        if !(0..=3810).contains(&pos) {
-            return Err("Position must be between 0 and 3810".to_string());
+        if !(0..=self.max_pos).contains(&pos) {
+            return Err(format!("Position must be between 0 and {}", self.max_pos));
         }
         self.set_pos(pos)?;
         let mut last_pos;

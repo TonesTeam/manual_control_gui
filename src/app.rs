@@ -3,7 +3,7 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use eframe::egui;
 
-use crate::config::{SELECTOR_16_MAX, SELECTOR_8_MAX, Settings};
+use crate::config::{MAIN_PUMP_MAX, SECONDARY_PUMP_MAX, SELECTOR_16_MAX, SELECTOR_8_MAX, Settings};
 use crate::worker::{Action, Command, DeviceConfig, DeviceId, Response, spawn_worker};
 
 #[derive(Default)]
@@ -71,8 +71,12 @@ impl App {
 
     fn device_config(&self, id: DeviceId) -> DeviceConfig {
         match id {
-            DeviceId::MainPump => DeviceConfig::Pump { has_solenoids: true },
-            DeviceId::SecondaryPump => DeviceConfig::Pump { has_solenoids: false },
+            DeviceId::MainPump => {
+                DeviceConfig::Pump { has_solenoids: true, max_pos: MAIN_PUMP_MAX }
+            }
+            DeviceId::SecondaryPump => {
+                DeviceConfig::Pump { has_solenoids: false, max_pos: SECONDARY_PUMP_MAX }
+            }
             DeviceId::Selector1 => DeviceConfig::Selector { max_pos: SELECTOR_8_MAX },
             DeviceId::Selector2 => DeviceConfig::Selector { max_pos: SELECTOR_8_MAX },
             DeviceId::Selector3 => DeviceConfig::Selector { max_pos: SELECTOR_16_MAX },
@@ -141,7 +145,7 @@ impl App {
         }
     }
 
-    fn pump_panel(&mut self, ui: &mut egui::Ui, id: DeviceId, has_solenoids: bool) {
+    fn pump_panel(&mut self, ui: &mut egui::Ui, id: DeviceId, has_solenoids: bool, max_pos: u16) {
         let state_snapshot = self
             .states
             .get(&id)
@@ -168,12 +172,13 @@ impl App {
 
             ui.horizontal(|ui| {
                 let inputs = self.inputs.get_mut(&id).unwrap();
-                ui.label("Go to position (0-3810):");
+                ui.label(format!("Go to position (0-{max_pos}):"));
                 let resp =
                     ui.add(egui::TextEdit::singleline(&mut inputs.pos_input).desired_width(60.0));
                 let enter_pressed =
                     resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                let target: Option<u16> = inputs.pos_input.trim().parse().ok();
+                let target: Option<u16> =
+                    inputs.pos_input.trim().parse().ok().filter(|p| *p <= max_pos);
                 let clicked = ui
                     .add_enabled(target.is_some(), egui::Button::new("Set Position"))
                     .clicked();
@@ -334,8 +339,8 @@ impl App {
         }
         ui.separator();
         egui::ScrollArea::vertical().show(ui, |ui| {
-            self.pump_panel(ui, DeviceId::MainPump, true);
-            self.pump_panel(ui, DeviceId::SecondaryPump, false);
+            self.pump_panel(ui, DeviceId::MainPump, true, MAIN_PUMP_MAX);
+            self.pump_panel(ui, DeviceId::SecondaryPump, false, SECONDARY_PUMP_MAX);
             self.selector_panel(ui, DeviceId::Selector1, SELECTOR_8_MAX);
             self.selector_panel(ui, DeviceId::Selector2, SELECTOR_8_MAX);
             self.selector_panel(ui, DeviceId::Selector3, SELECTOR_16_MAX);

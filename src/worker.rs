@@ -35,7 +35,7 @@ impl DeviceId {
 
 #[derive(Clone, Copy, Debug)]
 pub enum DeviceConfig {
-    Pump { has_solenoids: bool },
+    Pump { has_solenoids: bool, max_pos: u16 },
     Selector { max_pos: u16 },
 }
 
@@ -115,9 +115,10 @@ fn run_selector_action(selector: &SelectorController, action: &Action) -> Result
 
 fn execute(cmd: &Command) -> Result<Option<u16>, String> {
     match cmd.config {
-        DeviceConfig::Pump { has_solenoids } => {
-            let pump = PumpController::new(cmd.port.clone(), cmd.baud, cmd.slave_address)?
-                .with_solenoids(has_solenoids);
+        DeviceConfig::Pump { has_solenoids, max_pos } => {
+            let pump =
+                PumpController::new(cmd.port.clone(), cmd.baud, cmd.slave_address, max_pos)?
+                    .with_solenoids(has_solenoids);
             run_pump_action(&pump, &cmd.action)
         }
         DeviceConfig::Selector { max_pos } => {
