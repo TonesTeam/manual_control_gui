@@ -12,9 +12,9 @@ Is not being actively developed, only maintained.
 
 ## Hardware connections
 
-In order to run protocols, you must connect 1 USB cable
+In order to run commands, you must connect 1 USB cable
 
-- USB to CAN adapter
+- USB to RS485 adapter
 
 ## Building
 
