@@ -29,6 +29,22 @@ Rust (egui) program to monitor and manually control the Tones liquid processing 
 - **Log**: command results and faults. Tick *Raw frames* to see every TX/RX frame in hex.
 - **Settings**: backend, port, baud rate, slave addresses, poll rate, pump calibration, controller address, UI scale and schematic label size.
 
+## Screenshots
+
+**Draining slot 1.** PP02 pulls liquid out of slot 1 through SV03 port 6 (active path, flow dots, DRAINING badge). The side panel shows device, slot and reagent states and the selected pump's readout.
+
+![Monitor tab while PP02 drains slot 1](docs/images/monitor-draining.png)
+
+**Drawing reagent.** PP01 aspirates from C1 through SV01 port 1. The highlight runs from the pump through TC01, the bundle and TC02 to the bottle, and C1 shows DRAWING.
+
+![Monitor tab while PP01 draws reagent from C1](docs/images/monitor-drawing-reagent.png)
+
+**Right-click menu on a valve port.**
+
+![Right-click menu on SV02 port 15](docs/images/context-menu.png)
+
+Pump manufacturer documentation is in [`docs/datasheets/pumps`](docs/datasheets/pumps/README.md).
+
 ## Hardware connections
 
 - USB to RS485 adapter (pumps and valves, 9600 8N1 by default)
