@@ -1,0 +1,60 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: tstand_controler.exe
+            test: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bin: tstand_controler
+            test: true
+          # Intel Macs: cross-built on the Apple Silicon runner, so tests can't run.
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            bin: tstand_controler
+            test: false
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bin: tstand_controler
+            test: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+
+      - name: Test
+        if: matrix.test
+        run: cargo test --target ${{ matrix.target }}
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tstand_controler-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.bin }}
