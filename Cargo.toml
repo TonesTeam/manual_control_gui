@@ -4,14 +4,48 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 
+[lib]
+name = "tstand_controler"
+path = "src/lib.rs"
+
+# The GUI. Needs eframe, so it only builds with the default `gui` feature.
+[[bin]]
+name = "tstand_controler"
+path = "src/main.rs"
+required-features = ["gui"]
+
+# Runs the prime-and-calibrate sequence from a terminal, against a server.
+# Needs neither a display nor the CAN stack: it is a client.
+[[bin]]
+name = "tstand_prime"
+path = "src/bin/tstand_prime.rs"
+
+# The headless control server that owns the RS485 adapter. Builds with
+# `--no-default-features`, so a Raspberry Pi needs no X11/Wayland headers.
+[[bin]]
+name = "tstand_server"
+path = "src/bin/tstand_server.rs"
+
+[features]
+default = ["gui", "can"]
+gui = ["dep:eframe"]
+# The CAN link to the Peltier slot-temperature board. Only the machine with the
+# adapter needs it: a GUI reads temperature from the server like any other
+# state, so it can be left out of a display-only build. It pulls serialport's
+# default features, which on Linux means libudev.
+can = ["dep:slot-temp-sensor-can"]
+
 [dependencies]
 # Default features give wgpu (D3D12 / Metal / Vulkan); glow adds an OpenGL fallback
 # selectable with TSTAND_RENDERER=glow for VMs and old GPUs.
-eframe = { version = "0.35.0", features = ["glow"] }
+eframe = { version = "0.35.0", features = ["glow"], optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 # No libudev: Linux ports are enumerated from sysfs, so no system library is needed.
 serialport = { version = "4.2.0", default-features = false }
+# Peltier slot-temperature controller (DRV8701 + STM32C092) on the CAN adapter.
+# The board runs its own PID; this drives and observes it.
+slot-temp-sensor-can = { git = "https://github.com/TonesTeam/slot_temp_sensor_can_rs", branch = "windows", optional = true }
 
 [profile.release]
 strip = true
