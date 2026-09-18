@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::bus::{BusState, DevState};
 use crate::config::Settings;
-use crate::devices::{DeviceId, sv02_port_for_slot, sv03_port_for_slot};
+use crate::devices::{DeviceId, slot_for_sv02_port, sv02_port_for_slot, sv03_port_for_slot};
+use crate::fluidics::{Fill, Landmark};
+use crate::rig::{Rig, Role, SensorAt};
+use crate::sensors::Reading;
 use crate::tracking::{BOTTLE_CAPACITY_ML, BottleState, FluidView, SlotState};
 
 const W: f32 = 1760.0;
@@ -122,6 +125,14 @@ pub struct Palette {
     pub liquid: Color32,
     pub tag: Color32,
     pub tag_text: Color32,
+    /// Wall of a tube whose contents are modelled. Wide enough to read as a
+    /// bore, so what is inside it can be drawn as a fill rather than a colour.
+    pub bore: Color32,
+    /// A stretch nobody has observed, and the hatching that says so. It has to
+    /// be distinct from both liquid and the empty bore: unknown drawn as empty
+    /// is how old reagent gets pushed into a slot and called a wash.
+    pub unknown: Color32,
+    pub unknown_hatch: Color32,
 }
 
 impl Palette {
@@ -144,6 +155,9 @@ impl Palette {
                 liquid: Color32::from_rgb(60, 120, 200),
                 tag: Color32::from_rgb(120, 100, 40),
                 tag_text: Color32::from_rgb(245, 240, 225),
+                bore: Color32::from_rgb(76, 81, 90),
+                unknown: Color32::from_rgb(74, 66, 50),
+                unknown_hatch: Color32::from_rgb(208, 168, 88),
             }
         } else {
             Self {
@@ -163,6 +177,9 @@ impl Palette {
                 liquid: Color32::from_rgb(170, 205, 245),
                 tag: Color32::from_rgb(255, 236, 170),
                 tag_text: Color32::BLACK,
+                bore: Color32::from_rgb(148, 152, 160),
+                unknown: Color32::from_rgb(243, 233, 208),
+                unknown_hatch: Color32::from_rgb(186, 138, 36),
             }
         }
     }
@@ -448,6 +465,36 @@ fn inline(a: Pos2, b: Pos2) -> Vec<Pos2> {
     }
 }
 
+/// SV02 -> slot inlet routes, by slot. Inlets above the port get a single
+/// bend; the rest share lanes right of the valve and rows under the inlets,
+/// nested so they don't cross each other.
+///
+/// Kept apart from [`route_tubes`] because the liquid model draws on the same
+/// route: a fill that sits beside the tube it describes is worse than no fill.
+fn slot_feeds(l: &Layout) -> Vec<(u16, Vec<Pos2>)> {
+    let sv02 = l.pos("SV02");
+    let (r02, n02) = valve_geom(DeviceId::Sv02);
+    let (mut out, mut below) = (Vec::new(), Vec::new());
+    for slot in 1u16..=6 {
+        let port = port_pos(sv02, r02, n02, sv02_port_for_slot(slot));
+        let inlet = slot_inlet(l, slot);
+        if inlet.y < port.y - 12.0 {
+            out.push((slot, vec![port, pos2(inlet.x, port.y), inlet]));
+        } else {
+            below.push((slot, port, inlet));
+        }
+    }
+    below.sort_by(|a, b| a.2.x.total_cmp(&b.2.x));
+    let n = below.len();
+    let base_y = below.iter().map(|b| b.2.y).fold(f32::MIN, f32::max);
+    for (rank, (slot, port, inlet)) in below.into_iter().enumerate() {
+        let x = sv02.x + r02 + 24.0 + (n - 1 - rank) as f32 * LANE;
+        let y = base_y + 15.0 + rank as f32 * LANE;
+        out.push((slot, vec![port, pos2(x, port.y), pos2(x, y), pos2(inlet.x, y), inlet]));
+    }
+    out
+}
+
 struct Edge {
     pts: Vec<Pos2>,
     active: bool,
@@ -542,29 +589,9 @@ fn route_tubes(l: &Layout, state: &BusState) -> Vec<Edge> {
         let port = port_pos(sv02, r02, n02, p);
         push(into_tag(vec![port, pos2(port.x, sv02.y + r02 + 16.0)], tag_rect(l, key)), on02(p));
     }
-    // SV02 10..15 -> slots. Inlets above the port get a single bend; the rest
-    // share lanes right of the valve and rows under the inlets, nested so they
-    // don't cross each other.
-    {
-        let mut below = Vec::new();
-        for slot in 1u16..=6 {
-            let p = sv02_port_for_slot(slot);
-            let port = port_pos(sv02, r02, n02, p);
-            let inlet = slot_inlet(l, slot);
-            if inlet.y < port.y - 12.0 {
-                push(vec![port, pos2(inlet.x, port.y), inlet], on02(p));
-            } else {
-                below.push((p, port, inlet));
-            }
-        }
-        below.sort_by(|a, b| a.2.x.total_cmp(&b.2.x));
-        let n = below.len();
-        let base_y = below.iter().map(|b| b.2.y).fold(f32::MIN, f32::max);
-        for (rank, (p, port, inlet)) in below.into_iter().enumerate() {
-            let x = sv02.x + r02 + 24.0 + (n - 1 - rank) as f32 * LANE;
-            let y = base_y + 15.0 + rank as f32 * LANE;
-            push(vec![port, pos2(x, port.y), pos2(x, y), pos2(inlet.x, y), inlet], on02(p));
-        }
+    // SV02 10..15 -> slots.
+    for (slot, pts) in slot_feeds(l) {
+        push(pts, on02(sv02_port_for_slot(slot)));
     }
     // SV02 16 -> air filter.
     {
@@ -675,12 +702,250 @@ fn route_reagents(l: &Layout) -> Vec<ReagentTube> {
     tubes
 }
 
+// ── The liquid model on the diagram ──
+//
+// [`crate::fluidics`] stores contents as cumulative µL from a link's `from`
+// end. The schematic is not to scale — 150 µL and 800 µL are drawn at whatever
+// length the layout happens to give them — so a run is placed by fraction of
+// its link's volume against fraction of the drawn path's length. That keeps
+// the boundaries where the model says they are relative to the landmarks at
+// each end, which is the only thing an operator reads off them.
+
+/// Where one modelled link is drawn, in virtual coordinates.
+struct LiquidPath {
+    from: Landmark,
+    to: Landmark,
+    /// The path in one or more pieces. The hop from the SV02 common rim to the
+    /// selected port is hidden under the valve body, and counting its length
+    /// would put every boundary past S2 a fifth of a tube out of place.
+    legs: Vec<Vec<Pos2>>,
+}
+
+/// The holding coil, as the double spiral it is: both ends on the outside,
+/// wound in to a hairpin at the centre.
+///
+/// Concentric circles would be cheaper to draw, but the coil holds two thirds
+/// of the modelled volume, and a front crossing it is exactly what the
+/// operator is waiting for. A spiral is one continuous path, so the fill and
+/// the flow animation run through it like any other tube.
+fn coil_spiral(center: Pos2, outer: f32, inner: f32, turns: usize) -> Vec<Pos2> {
+    let steps = turns * 24;
+    let span = turns as f32 * std::f32::consts::TAU;
+    let arm = |k: usize, offset: f32| {
+        let th = span * k as f32 / steps as f32;
+        let a = offset + th;
+        center + vec2(a.cos(), a.sin()) * (inner + (outer - inner) * (th / span))
+    };
+    let mut pts: Vec<Pos2> = (0..=steps).rev().map(|k| arm(k, std::f32::consts::PI)).collect();
+    // The hairpin at the middle, joining the two arms.
+    pts.extend((1..12).map(|k| {
+        let a = std::f32::consts::PI * (1.0 + k as f32 / 12.0);
+        center + vec2(a.cos(), a.sin()) * inner
+    }));
+    pts.extend((0..=steps).map(|k| arm(k, 0.0)));
+    pts
+}
+
+/// The two SV02 destinations the model names: the slot being fed, and waste.
+///
+/// The valve's current port wins, so the drawing follows the path the rig is
+/// actually on; failing that the rig's commissioning says which slot and which
+/// waste port are plumbed.
+fn sv02_destinations(rig: &Rig, state: &BusState) -> (u16, u16) {
+    let on_sv02 = |role: Role| rig.ports.iter().find(|u| u.valve == DeviceId::Sv02 && u.role == role).map(|u| u.port);
+    let slot = state
+        .dev(DeviceId::Sv02)
+        .value
+        .filter(|p| *p > 0)
+        .and_then(slot_for_sv02_port)
+        .or_else(|| on_sv02(Role::SlotFill).and_then(slot_for_sv02_port))
+        .or_else(|| rig.only_slot())
+        .or_else(|| (1..=6).find(|s| rig.slot_fitted(*s)))
+        .unwrap_or(6);
+    (slot, on_sv02(Role::Waste).unwrap_or(9))
+}
+
+/// Where each modelled link is drawn.
+///
+/// This retraces [`route_tubes`] rather than reusing its output, because a
+/// link is one physical stretch of tube and the drawn edges do not line up
+/// with it one for one: `S1 → S2` runs through the holding coil, and the two
+/// links past S2 share the stub from S2 into SV02.
+fn liquid_paths(l: &Layout, state: &BusState, slot: u16, waste_port: u16) -> Vec<LiquidPath> {
+    let (pp01, s1, coil, s2, sv02) = (l.pos("PP01"), l.pos("S1"), l.pos("COIL"), l.pos("S2"), l.pos("SV02"));
+    let (r02, n02) = valve_geom(DeviceId::Sv02);
+    // Rounding in virtual space is the same as rounding in screen space, since
+    // the transform is a uniform scale — and it keeps the fill sitting on the
+    // corners `tube()` draws for every other route.
+    let bend = |pts: Vec<Pos2>| rounded(&clean(pts), 8.0);
+
+    let mut through_coil = bend(inline(s1 + vec2(11.0, 0.0), coil - vec2(65.0, 0.0)));
+    through_coil.extend(coil_spiral(coil, 65.0, 12.0, 2));
+    through_coil.extend(bend(inline(coil + vec2(65.0, 0.0), s2 - vec2(11.0, 0.0))));
+
+    let e = rim_between(sv02, r02, n02, 5, 6);
+    let a = s2 + vec2(11.0, 0.0);
+    let jog = (sv02.x - r02 - 24.0 - 5.0 * LANE - 14.0).max(a.x + 8.0);
+    let stub = bend(vec![a, pos2(jog, a.y), pos2(jog, e.y), e]);
+    let feed = slot_feeds(l).into_iter().find(|(s, _)| *s == slot).map(|(_, pts)| bend(pts)).unwrap_or_default();
+    let waste_key = ["TAG_ROUTER", "TAG_SV02_DANGER", "TAG_SV02_WASTE"]
+        .into_iter()
+        .find(|k| tag_port(k) == (DeviceId::Sv02, waste_port))
+        .unwrap_or("TAG_SV02_WASTE");
+    let wp = port_pos(sv02, r02, n02, waste_port);
+    let drain = bend(into_tag(vec![wp, pos2(wp.x, sv02.y + r02 + 16.0)], tag_rect(l, waste_key)));
+    // The stub from S2 into the valve is one piece of tube that the model
+    // charges to both links. It is drawn with whichever one the valve has
+    // connected — only one of them can be — so it is never filled twice.
+    let (mut to_slot, mut to_waste) = (vec![feed], vec![drain]);
+    if state.dev(DeviceId::Sv02).value == Some(waste_port) {
+        to_waste.insert(0, stub);
+    } else {
+        to_slot.insert(0, stub);
+    }
+
+    vec![
+        LiquidPath { from: Landmark::Pump, to: Landmark::S1, legs: vec![bend(inline(pp01 + vec2(45.0, 0.0), s1 - vec2(11.0, 0.0)))] },
+        LiquidPath { from: Landmark::S1, to: Landmark::S2, legs: vec![through_coil] },
+        LiquidPath { from: Landmark::S2, to: Landmark::Slot, legs: to_slot },
+        LiquidPath { from: Landmark::S2, to: Landmark::Waste, legs: to_waste },
+    ]
+}
+
+fn path_len(pts: &[Pos2]) -> f32 {
+    pts.windows(2).map(|w| w[0].distance(w[1])).sum()
+}
+
+/// The stretch of a polyline between two distances from its start.
+///
+/// A drawn tube is several segments, and a run boundary lands wherever it
+/// lands, so segments have to be split rather than picked.
+fn slice_polyline(pts: &[Pos2], from: f32, to: f32) -> Vec<Pos2> {
+    let mut out: Vec<Pos2> = Vec::new();
+    if pts.len() < 2 || to <= from {
+        return out;
+    }
+    let mut acc = 0.0;
+    for w in pts.windows(2) {
+        let len = w[0].distance(w[1]);
+        let (a, b) = (acc, acc + len);
+        acc = b;
+        if len <= 1e-6 || b <= from || a >= to {
+            continue;
+        }
+        let at = |d: f32| w[0] + (w[1] - w[0]) * ((d - a) / len);
+        if out.is_empty() {
+            out.push(if from > a { at(from) } else { w[0] });
+        }
+        out.push(if to < b { at(to) } else { w[1] });
+    }
+    out
+}
+
+/// Position and unit direction at a distance along a polyline.
+fn point_along(pts: &[Pos2], at: f32) -> Option<(Pos2, Vec2)> {
+    let mut acc = 0.0;
+    let mut last = None;
+    for w in pts.windows(2) {
+        let d = w[1] - w[0];
+        let len = d.length();
+        if len <= 1e-6 {
+            continue;
+        }
+        if at <= acc + len {
+            return Some((w[0] + d * ((at - acc) / len).max(0.0), d / len));
+        }
+        acc += len;
+        last = Some((w[1], d / len));
+    }
+    last
+}
+
+/// Distance from a point to a polyline, with how far along the nearest point lies.
+fn nearest_on_path(pts: &[Pos2], p: Pos2) -> (f32, f32) {
+    let mut best = (f32::MAX, 0.0);
+    let mut acc = 0.0;
+    for w in pts.windows(2) {
+        let d = w[1] - w[0];
+        let len = d.length();
+        if len > 1e-6 {
+            let k = ((p - w[0]).dot(d) / (len * len)).clamp(0.0, 1.0);
+            let dist = (w[0] + d * k).distance(p);
+            if dist < best.0 {
+                best = (dist, acc + k * len);
+            }
+        }
+        acc += len;
+    }
+    best
+}
+
+fn legs_len(legs: &[Vec<Pos2>]) -> f32 {
+    legs.iter().map(|p| path_len(p)).sum()
+}
+
+/// [`slice_polyline`] across a path drawn in several pieces.
+fn slice_legs(legs: &[Vec<Pos2>], from: f32, to: f32) -> Vec<Vec<Pos2>> {
+    let mut out = Vec::new();
+    let mut acc = 0.0;
+    for leg in legs {
+        let part = slice_polyline(leg, from - acc, to - acc);
+        if part.len() >= 2 {
+            out.push(part);
+        }
+        acc += path_len(leg);
+    }
+    out
+}
+
+fn point_on_legs(legs: &[Vec<Pos2>], at: f32) -> Option<(Pos2, Vec2)> {
+    let mut acc = 0.0;
+    for (i, leg) in legs.iter().enumerate() {
+        let len = path_len(leg);
+        if at <= acc + len || i + 1 == legs.len() {
+            return point_along(leg, at - acc);
+        }
+        acc += len;
+    }
+    None
+}
+
+fn nearest_on_legs(legs: &[Vec<Pos2>], p: Pos2) -> (f32, f32) {
+    let mut best = (f32::MAX, 0.0);
+    let mut acc = 0.0;
+    for leg in legs {
+        let (dist, at) = nearest_on_path(leg, p);
+        if dist < best.0 {
+            best = (dist, acc + at);
+        }
+        acc += path_len(leg);
+    }
+    best
+}
+
+/// Diagonal ticks along a stretch of tube. At 45° to the bore they cannot be
+/// read as a run boundary, and they carry no direction, so a stretch nobody
+/// has observed never looks like it is flowing.
+fn hatch(painter: &egui::Painter, pts: &[Pos2], spacing: f32, half: f32, stroke: Stroke) {
+    let total = path_len(pts);
+    let mut at = spacing * 0.5;
+    while at < total && spacing > 0.5 {
+        if let Some((p, d)) = point_along(pts, at) {
+            let axis = vec2(d.x - d.y, d.y + d.x) * std::f32::consts::FRAC_1_SQRT_2;
+            painter.line_segment([p - axis * half, p + axis * half], stroke);
+        }
+        at += spacing;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut egui::Ui,
     state: &BusState,
     settings: &Settings,
     fluid: &FluidView,
+    // `liquid` is where the model believes the liquid is, for filling the tubes.
+    liquid: &crate::fluidics::Fluidics,
     selected: Option<DeviceId>,
     time: f64,
     layout: &mut Layout,
@@ -870,34 +1135,173 @@ pub fn show(
     text(air_c, Align2::CENTER_CENTER, "Air", 13.0, pal.text);
     text(air_c + vec2(40.0, -10.0), Align2::LEFT_CENTER, "filter / port", 11.0, pal.dim);
 
-    // Holding coil.
+    let rig = &settings.rig;
+    let hover = if edit { None } else { response.hover_pos() };
+
+    // ── What is in the tubes ──
+    //
+    // The routes above say what is connected; this says what is in it. It goes
+    // on after the idle plumbing and before the slots and valves, so the fill
+    // covers the plain tube it describes and the components still sit on top.
+    // The holding coil is drawn here too: it is a length of the S1 → S2 tube,
+    // not a separate part, and drawing it as anything else would leave two
+    // thirds of the modelled volume off the diagram.
     let coil = l.pos("COIL");
-    for k in 0..7 {
-        painter.circle_stroke(t(coil), s(10.0 + k as f32 * 8.0), Stroke::new(sw(1.3), if !pp01_input { pal.flow_idle } else { pal.line }));
+    let (fill_slot, waste_port) = sv02_destinations(rig, state);
+    // Everything past the pump moves together, and only with the solenoid on
+    // the coil. Aspirating (position rising) pulls back along the path.
+    let flow_dir = if pp01_input { 0 } else { -dev(DeviceId::Pp01).motion };
+    let mut tube_hover: Option<String> = None;
+    for path in liquid_paths(l, state, fill_slot, waste_port) {
+        let legs: Vec<Vec<Pos2>> = path.legs.iter().map(|leg| leg.iter().map(|&p| t(p)).collect()).collect();
+        let total = legs_len(&legs);
+        if total < 1.0 {
+            continue;
+        }
+        let link = liquid.link(path.from, path.to);
+        // The bore is the tube itself, drawn whether or not the model knows
+        // anything about it. A length that was guessed rather than measured
+        // says so by being fainter, so a figure read off it is not taken for
+        // a measurement.
+        let wall = if link.is_some_and(|k| k.measured) { pal.bore } else { pal.bore.gamma_multiply(0.5) };
+        for leg in &legs {
+            painter.line(leg.clone(), Stroke::new(sw(7.0), wall));
+        }
+        let Some(link) = link else { continue };
+        let bore = sw(4.6);
+        let mut prev = 0.0;
+        for &(end, fill) in &link.runs {
+            let span = link.volume_ul.max(1e-3);
+            let (a, b) = ((prev / span) * total, (end / span) * total);
+            prev = end;
+            let run = slice_legs(&legs, a, b);
+            let colour = match fill {
+                Fill::Liquid => pal.flow,
+                // Air is the empty bore: the background, inside the wall.
+                Fill::Air => pal.bg,
+                Fill::Unknown => pal.unknown,
+            };
+            for seg in &run {
+                painter.line(seg.clone(), Stroke::new(bore, colour));
+                match fill {
+                    Fill::Unknown => hatch(&painter, seg, s(9.0), bore * 0.85, Stroke::new(sw(1.1), pal.unknown_hatch)),
+                    // Only liquid is animated. Nothing is known to be moving
+                    // through an unobserved stretch.
+                    Fill::Liquid if flow_dir != 0 => draw_flow_dots(&painter, seg, flow_dir, time, s(24.0), bore * 0.42, pal.bg),
+                    _ => {}
+                }
+            }
+            // One `?` per unobserved stretch that has room for it. On a rig
+            // that has just been switched on every link is one long unknown
+            // run, which is meant to read as four deliberate marks rather than
+            // as a fault.
+            if fill == Fill::Unknown
+                && b - a > s(50.0)
+                && let Some((p, _)) = point_on_legs(&legs, (a + b) * 0.5)
+            {
+                painter.circle_filled(p, s(6.5), pal.unknown);
+                painter.text(p, Align2::CENTER_CENTER, "?", font(14.0), pal.unknown_hatch);
+            }
+        }
+        // The front is the thing being watched. It pulses so it reads as live
+        // rather than as one more boundary between runs.
+        if let Some(front) = link.front_ul()
+            && let Some((p, d)) = point_on_legs(&legs, (front / link.volume_ul.max(1e-3)).clamp(0.0, 1.0) * total)
+        {
+            let n = vec2(-d.y, d.x) * bore * 0.95;
+            let pulse = 0.6 + 0.4 * (time as f32 * 3.0).sin();
+            painter.line_segment([p - n, p + n], Stroke::new(sw(2.8), pal.flow));
+            painter.circle_filled(p, s(2.6), pal.bg.gamma_multiply(pulse));
+        }
+        if !link.measured
+            && let Some((p, d)) = point_on_legs(&legs, (total * 0.1).min(s(26.0)))
+        {
+            painter.text(p + vec2(-d.y, d.x) * s(12.0), Align2::CENTER_CENTER, "≈", font(15.0), pal.dim);
+        }
+        if let Some(h) = hover.filter(|_| tube_hover.is_none()) {
+            let (dist, at) = nearest_on_legs(&legs, h);
+            if dist < s(9.0) {
+                let ul = (at / total) * link.volume_ul;
+                let what = match link.fill_at(ul) {
+                    Fill::Unknown => "nobody has looked".to_string(),
+                    f => f.label().to_string(),
+                };
+                tube_hover = Some(format!("{}\n{ul:.0} µL from {}: {what}", liquid.describe(path.from, path.to), path.from.label()));
+            }
+        }
+    }
+    if let Some(note) = tube_hover {
+        response.clone().on_hover_text(note);
     }
     text(coil + vec2(0.0, 80.0), Align2::CENTER_CENTER, "Spiral tube (holding coil)", 12.5, pal.dim);
 
-    // Sensors (optical, on CAN via controller_v2, not polled here).
-    let sensor = |p: Pos2, name: &str, label_at: Vec2, anchor: Align2| {
-        let r = Rect::from_center_size(t(p), vec2(s(22.0), s(28.0)));
-        painter.rect(r, s(4.0), pal.panel, Stroke::new(sw(1.2), pal.line), StrokeKind::Inside);
-        painter.circle_filled(t(p), s(5.0), pal.offline);
-        text(p + label_at, anchor, name, 11.5, pal.dim);
+    // Optical liquid sensors. Drawn as what they are: a fork with the tube
+    // running through it, emitter on one side and detector on the other, lit
+    // when the beam is broken by liquid.
+    let sensor = |p: Pos2, name: &str, reading: Reading, label_at: Vec2, anchor: Align2| {
+        let c = t(p);
+        let body = Rect::from_center_size(c, vec2(s(22.0), s(28.0)));
+        let (fill, eye, ring) = match reading {
+            Reading::Liquid => (pal.liquid.gamma_multiply(0.35), pal.liquid, pal.flow),
+            Reading::Dry => (pal.panel, pal.dim, pal.line),
+            Reading::Unknown => (pal.panel, pal.offline, pal.dim.gamma_multiply(0.6)),
+        };
+        painter.rect(body, s(4.0), fill, Stroke::new(sw(1.2), ring), StrokeKind::Inside);
+        // The jaws: two stubs top and bottom, with the tube's gap between them.
+        for dy in [-1.0f32, 1.0] {
+            let jaw = Rect::from_center_size(
+                c + vec2(0.0, s(10.0) * dy),
+                vec2(s(22.0), s(6.0)),
+            );
+            painter.rect_filled(jaw, s(2.0), ring.gamma_multiply(0.5));
+        }
+        painter.circle_filled(c, s(4.5), eye);
+        if reading == Reading::Liquid {
+            // A ring around the eye, so "wet" reads at a glance across a bench.
+            painter.circle_stroke(c, s(7.5), Stroke::new(sw(1.4), pal.flow));
+        }
+        let name_color = if reading == Reading::Unknown { pal.dim } else { pal.text };
+        text(p + label_at, anchor, name, 11.5, name_color);
     };
-    sensor(l.pos("S1"), "S1", vec2(0.0, 26.0), Align2::CENTER_CENTER);
-    sensor(l.pos("S2"), "S2", vec2(0.0, 26.0), Align2::CENTER_CENTER);
+
+    let sensor_reading = |at: SensorAt| -> (String, Reading) {
+        match rig.sensor_at(at) {
+            Some(s) => (s.name.clone(), Reading::of(&state.sensors, s.channel)),
+            // Not wired on this rig: keep the diagram's own name, no reading.
+            None => (
+                match at {
+                    SensorAt::Inline1 => "S1".to_string(),
+                    SensorAt::Inline2 => "S2".to_string(),
+                    SensorAt::Slot => "S".to_string(),
+                },
+                Reading::Unknown,
+            ),
+        }
+    };
+    for (key, at) in [("S1", SensorAt::Inline1), ("S2", SensorAt::Inline2)] {
+        let (name, reading) = sensor_reading(at);
+        sensor(l.pos(key), &name, reading, vec2(0.0, 26.0), Align2::CENTER_CENTER);
+    }
 
     let a02 = dev(DeviceId::Sv02).value.filter(|p| *p > 0);
     let a03 = dev(DeviceId::Sv03).value.filter(|p| *p > 0);
 
-    // Slots.
+    // Slots. A slot with no cassette fitted is drawn faint and unlabelled:
+    // still there, so the plumbing makes sense, but plainly not in use.
     for slot in 1u16..=6 {
+        let fitted = rig.slot_fitted(slot);
         let c = l.pos(&slot_key(slot));
         let rr = Rect::from_center_size(t(c), vec2(s(90.0), s(150.0)));
-        let feeding = !pp01_input && a02 == Some(sv02_port_for_slot(slot));
-        let draining = a03 == Some(sv03_port_for_slot(slot));
-        let stroke = if feeding || draining { Stroke::new(sw(3.0), pal.flow) } else { Stroke::new(sw(1.5), pal.line) };
+        let feeding = fitted && !pp01_input && a02 == Some(sv02_port_for_slot(slot));
+        let draining = fitted && a03 == Some(sv03_port_for_slot(slot));
+        let line = if fitted { pal.line } else { pal.dim.gamma_multiply(0.4) };
+        let stroke = if feeding || draining { Stroke::new(sw(3.0), pal.flow) } else { Stroke::new(sw(1.5), line) };
         painter.rect(rr, s(10.0), pal.panel, stroke, StrokeKind::Inside);
+        if !fitted {
+            text(c + vec2(0.0, -4.0), Align2::CENTER_CENTER, "not fitted", 11.5, pal.dim);
+            text(c + vec2(-37.0, -63.0), Align2::LEFT_CENTER, &format!("Slot {slot}"), 12.5, pal.dim);
+            continue;
+        }
         // Vial filled to the estimated volume.
         let (st, vol_ul) = fluid.slots[slot as usize - 1];
         let vial = Rect::from_center_size(t(c + vec2(0.0, -4.0)), vec2(s(34.0), s(92.0)));
@@ -906,9 +1310,27 @@ pub fn show(
         painter.rect_filled(Rect::from_min_max(pos2(vial.min.x, vial.max.y - vial.height() * frac), vial.max), s(3.0), pal.liquid);
         painter.rect_stroke(vial, s(3.0), Stroke::new(sw(1.0), pal.line), StrokeKind::Inside);
         text(c + vec2(-37.0, -63.0), Align2::LEFT_CENTER, &format!("Slot {slot}"), 12.5, pal.text);
-        painter.text(t(c + vec2(0.0, 58.0)), Align2::CENTER_CENTER, format!("~{vol_ul:.0} µL"), lfont(11.0), pal.text);
         badge(c - vec2(0.0, 88.0), st.label(), slot_color(st), lfont(11.0));
-        sensor(pos2(c.x - 20.0, c.y + 91.0), &format!("S{}", slot + 2), vec2(16.0, 0.0), Align2::LEFT_CENTER);
+        // The temperature board holds one slot, so its reading belongs on that
+        // slot. It stacks under the volume rather than sharing the top line
+        // with the slot's name: the box is 90 px wide and "Slot 6" and
+        // "24.1 °C" ran into each other there.
+        let hot = rig.only_slot() == Some(slot) && state.temp.enabled;
+        let deg = hot.then_some(state.temp.temperature_c).flatten();
+        let volume_y = if deg.is_some() { 50.0 } else { 58.0 };
+        painter.text(t(c + vec2(0.0, volume_y)), Align2::CENTER_CENTER, format!("~{vol_ul:.0} µL"), lfont(11.0), pal.text);
+        if let Some(deg) = deg {
+            let colour = if state.temp.sensor_fault {
+                Color32::from_rgb(225, 80, 80)
+            } else if state.temp.pid_running {
+                pal.flow
+            } else {
+                pal.text
+            };
+            painter.text(t(c + vec2(0.0, 66.0)), Align2::CENTER_CENTER, format!("{deg:.1} °C"), lfont(11.0), colour);
+        }
+        let (sensor_name, reading) = sensor_reading(SensorAt::Slot);
+        sensor(pos2(c.x - 20.0, c.y + 91.0), &sensor_name, reading, vec2(16.0, 0.0), Align2::LEFT_CENTER);
         painter.circle_filled(t(slot_outlet(l, slot).0), s(4.0), pal.line);
     }
 
@@ -920,7 +1342,6 @@ pub fn show(
         out.menu_target = Some(target_at(l, v, big));
     }
     let clicked = response.clicked() && !edit;
-    let hover = if edit { None } else { response.hover_pos() };
 
     // Valves: name and current port are written inside the body, clear of the tubes.
     for id in [DeviceId::Sv01, DeviceId::Sv02, DeviceId::Sv03] {
@@ -943,11 +1364,21 @@ pub fn show(
             let pp = t(port_pos(center, r, ports, p));
             let is_cur = current == Some(p);
             let hovered = hover.is_some_and(|h| h.distance(pp) < s(port_r));
+            let plumbed = rig.port_plumbed(id, p);
             let fill = if is_cur { pal.flow } else if hovered { pal.bundle } else { pal.panel };
-            painter.circle(pp, s(port_r), fill, Stroke::new(sw(1.3), pal.line));
-            painter.text(pp, Align2::CENTER_CENTER, p.to_string(), font(if ports == 16 { 11.0 } else { 12.5 }), if is_cur { Color32::WHITE } else { pal.text });
+            let ring = if plumbed { pal.line } else { pal.dim.gamma_multiply(0.45) };
+            painter.circle(pp, s(port_r), fill, Stroke::new(sw(1.3), ring));
+            let number = if is_cur {
+                Color32::WHITE
+            } else if plumbed {
+                pal.text
+            } else {
+                pal.dim
+            };
+            painter.text(pp, Align2::CENTER_CENTER, p.to_string(), font(if ports == 16 { 11.0 } else { 12.5 }), number);
             if hovered {
-                response.clone().on_hover_text(format!("{} port {p}: {}", id.tag(), id.port_label(p)));
+                let note = if rig.port_allowed(id, p) { "" } else { " — not plumbed on this rig" };
+                response.clone().on_hover_text(format!("{} port {p}: {}{note}", id.tag(), rig.port_label(id, p)));
             }
             if clicked && pointer.is_some_and(|q| q.distance(pp) < s(port_r)) {
                 out.clicked_port = Some((id, p));
@@ -1062,7 +1493,7 @@ pub fn show(
     let hint = if edit {
         "Move mode: drag any component; tubes re-route and it snaps to a 10 px grid on release."
     } else {
-        "S1–S8 are CAN optical sensors read by controller_v2; they are not polled over RS485."
+        "Optical sensors (A0–A5) are on the CAN adapter and read by controller_v2; they are not polled over RS485."
     };
     text(pos2(24.0, 982.0), Align2::LEFT_CENTER, hint, 11.0, if edit { pal.busy } else { pal.dim });
 
@@ -1218,6 +1649,12 @@ mod tests {
         for e in route_tubes(&l, &state) {
             poly(&mut svg, &e.pts, "#46484e", 1.6);
         }
+        // The modelled tubes, including the coil, on top of the plain routes.
+        for path in liquid_paths(&l, &state, 6, 9) {
+            for leg in &path.legs {
+                poly(&mut svg, leg, "#94989f", 7.0);
+            }
+        }
         let rect = |svg: &mut String, r: Rect, fill: &str, label: &str| {
             let _ = write!(svg, r##"<rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" rx="5" fill="{fill}" stroke="#46484e"/><text x="{:.1}" y="{:.1}" text-anchor="middle" dominant-baseline="middle">{label}</text>"##, r.min.x, r.min.y, r.width(), r.height(), r.center().x, r.center().y);
         };
@@ -1242,7 +1679,7 @@ mod tests {
             rect(&mut svg, Rect::from_center_size(l.pos(key), vec2(90.0, 160.0)), "#fff", key);
         }
         let coil = l.pos("COIL");
-        let _ = write!(svg, r##"<circle cx="{}" cy="{}" r="58" fill="#fff" stroke="#5a96d2"/><text x="{}" y="{}" text-anchor="middle">coil</text>"##, coil.x, coil.y, coil.x, coil.y);
+        let _ = write!(svg, r##"<text x="{}" y="{}" text-anchor="middle">coil</text>"##, coil.x, coil.y + 80.0);
         for id in [DeviceId::Sv01, DeviceId::Sv02, DeviceId::Sv03] {
             let c = l.pos(id.tag());
             let (r, n) = valve_geom(id);
@@ -1300,6 +1737,110 @@ mod tests {
             let (id, port) = tag_port(key);
             assert_eq!(id.port_label(port), tag_text(key), "{key}");
         }
+    }
+
+    /// A run boundary lands wherever the volume puts it, which is rarely on a
+    /// corner, so the cut has to split a segment and keep the corners between.
+    #[test]
+    fn slicing_a_polyline_splits_the_segment_the_cut_lands_in() {
+        let pts = vec![pos2(0.0, 0.0), pos2(10.0, 0.0), pos2(10.0, 10.0)];
+        assert_eq!(path_len(&pts), 20.0);
+        assert_eq!(slice_polyline(&pts, 5.0, 15.0), vec![pos2(5.0, 0.0), pos2(10.0, 0.0), pos2(10.0, 5.0)]);
+        // The whole thing, and past both ends, give the polyline back unharmed.
+        assert_eq!(slice_polyline(&pts, 0.0, 20.0), pts);
+        assert_eq!(slice_polyline(&pts, -5.0, 99.0), pts);
+        // A run of no length draws nothing rather than a dot.
+        assert!(slice_polyline(&pts, 12.0, 12.0).is_empty());
+        assert!(slice_polyline(&pts, 15.0, 3.0).is_empty());
+        // A cut inside one segment stays inside it.
+        assert_eq!(slice_polyline(&pts, 2.0, 4.0), vec![pos2(2.0, 0.0), pos2(4.0, 0.0)]);
+    }
+
+    #[test]
+    fn a_point_along_a_polyline_carries_the_direction_it_is_travelling() {
+        let pts = vec![pos2(0.0, 0.0), pos2(10.0, 0.0), pos2(10.0, 10.0)];
+        let (p, d) = point_along(&pts, 15.0).unwrap();
+        assert_eq!((p, d), (pos2(10.0, 5.0), vec2(0.0, 1.0)));
+        assert_eq!(point_along(&pts, 0.0).unwrap().0, pos2(0.0, 0.0));
+        // Past the end it stops at the end rather than extrapolating.
+        assert_eq!(point_along(&pts, 99.0).unwrap().0, pos2(10.0, 10.0));
+        // Hovering beside the tube says how far along it the pointer is.
+        let (dist, at) = nearest_on_path(&pts, pos2(12.0, 5.0));
+        assert!((dist - 2.0).abs() < 1e-3 && (at - 15.0).abs() < 1e-3, "{dist} {at}");
+    }
+
+    /// Legs exist so the hop hidden under the SV02 body is not counted; the
+    /// length domain has to run straight across the join.
+    #[test]
+    fn legs_are_one_length_domain_with_the_gaps_left_out() {
+        let legs = vec![vec![pos2(0.0, 0.0), pos2(10.0, 0.0)], vec![pos2(100.0, 0.0), pos2(100.0, 10.0)]];
+        assert_eq!(legs_len(&legs), 20.0);
+        assert_eq!(point_on_legs(&legs, 15.0).unwrap().0, pos2(100.0, 5.0));
+        let cut = slice_legs(&legs, 5.0, 15.0);
+        assert_eq!(cut, vec![vec![pos2(5.0, 0.0), pos2(10.0, 0.0)], vec![pos2(100.0, 0.0), pos2(100.0, 5.0)]]);
+        assert_eq!(nearest_on_legs(&legs, pos2(102.0, 5.0)).1, 15.0);
+    }
+
+    #[test]
+    fn the_coil_spiral_starts_and_ends_on_the_stubs_it_joins() {
+        let c = pos2(100.0, 100.0);
+        let sp = coil_spiral(c, 65.0, 12.0, 2);
+        assert!(sp[0].distance(c - vec2(65.0, 0.0)) < 0.5, "enters on the left, where the S1 stub ends");
+        assert!(sp.last().unwrap().distance(c + vec2(65.0, 0.0)) < 0.5, "leaves on the right, where the S2 stub starts");
+        // Inside the coil's own box, so it cannot foul a neighbouring route.
+        assert!(sp.iter().all(|p| p.distance(c) <= 65.5));
+        assert!(sp.windows(2).all(|w| w[0].distance(w[1]) < 20.0), "sampled finely enough to read as a curve");
+        // And long enough that the 800 µL it holds has somewhere to go.
+        assert!(path_len(&sp) > 900.0, "{}", path_len(&sp));
+    }
+
+    #[test]
+    fn the_modelled_tubes_are_drawn_on_the_routes_they_describe() {
+        let l = Layout::default();
+        let state = crate::bus::BusState::for_tests();
+        let paths = liquid_paths(&l, &state, 6, 9);
+        let find = |to: Landmark| paths.iter().find(|p| p.to == to).expect("a path");
+        // Pump → S1 is the drawn stub between them, end to end.
+        let pump = find(Landmark::S1);
+        assert!(pump.legs[0][0].distance(l.pos("PP01") + vec2(45.0, 0.0)) < 0.5);
+        assert!(pump.legs[0].last().unwrap().distance(l.pos("S1") - vec2(11.0, 0.0)) < 0.5);
+        // S1 → S2 is one tube with the coil in the middle of it, and most of
+        // its drawn length is the coil — which is where most of its volume is.
+        let coil_run = find(Landmark::S2);
+        assert_eq!(coil_run.legs.len(), 1, "one continuous tube through the coil");
+        assert!(coil_run.legs[0][0].distance(l.pos("S1") + vec2(11.0, 0.0)) < 0.5);
+        assert!(coil_run.legs[0].last().unwrap().distance(l.pos("S2") - vec2(11.0, 0.0)) < 0.5);
+        assert!(path_len(&coil_run.legs[0]) > 900.0);
+        // S2 → slot ends at the slot's inlet, on the route route_tubes draws.
+        let feed = find(Landmark::Slot);
+        assert!(feed.legs.last().unwrap().last().unwrap().distance(slot_inlet(&l, 6)) < 0.5);
+        assert!(feed.legs[0][0].distance(l.pos("S2") + vec2(11.0, 0.0)) < 0.5, "the shared stub starts at S2");
+    }
+
+    #[test]
+    fn the_stub_into_sv02_goes_with_whichever_link_is_connected() {
+        let l = Layout::default();
+        let mut state = crate::bus::BusState::for_tests();
+        let legs = |state: &BusState, to: Landmark| liquid_paths(&l, state, 6, 9).into_iter().find(|p| p.to == to).unwrap().legs.len();
+        // Parked: the shared stub is drawn with the slot, the path the rig is for.
+        assert_eq!((legs(&state, Landmark::Slot), legs(&state, Landmark::Waste)), (2, 1));
+        // On waste, it goes with waste — never with both, or it is filled twice.
+        state.devices[DeviceId::Sv02 as usize].value = Some(9);
+        assert_eq!((legs(&state, Landmark::Slot), legs(&state, Landmark::Waste)), (1, 2));
+    }
+
+    #[test]
+    fn the_drawn_destinations_follow_the_valve_then_the_rig() {
+        let mut state = crate::bus::BusState::for_tests();
+        let rig = Rig::default();
+        // Nothing selected: the rig's own slot-fill and waste ports.
+        assert_eq!(sv02_destinations(&rig, &state), (6, 9));
+        // Selected: whatever the valve is actually on, so the fill is drawn on
+        // the tube the liquid is really in.
+        state.devices[DeviceId::Sv02 as usize].value = Some(sv02_port_for_slot(2));
+        assert_eq!(sv02_destinations(&rig, &state).0, 2);
+        // An uncommissioned rig still has somewhere to draw.
+        assert_eq!(sv02_destinations(&Rig::unrestricted(), &crate::bus::BusState::for_tests()), (1, 9));
     }
 
     /// True when two axis-aligned segments run on the same line and share more than a point.

@@ -1,0 +1,66 @@
+{
+  "bore_id_mm": 1.0,
+  "pump_fill": "Unknown",
+  "links": [
+    {
+      "from": "Pump",
+      "to": "S1",
+      "volume_ul": 83.32,
+      "measured": true,
+      "runs": [
+        [
+          83.32,
+          "Unknown"
+        ]
+      ]
+    },
+    {
+      "from": "S1",
+      "to": "S2",
+      "volume_ul": 2216.3118,
+      "measured": true,
+      "runs": [
+        [
+          2216.3118,
+          "Unknown"
+        ]
+      ]
+    },
+    {
+      "from": "S2",
+      "to": "Slot",
+      "volume_ul": 16.664,
+      "measured": true,
+      "runs": [
+        [
+          16.664,
+          "Unknown"
+        ]
+      ]
+    },
+    {
+      "from": "Wash",
+      "to": "Pump",
+      "volume_ul": 200.0,
+      "measured": false,
+      "runs": [
+        [
+          200.0,
+          "Unknown"
+        ]
+      ]
+    },
+    {
+      "from": "S2",
+      "to": "Waste",
+      "volume_ul": 250.0,
+      "measured": false,
+      "runs": [
+        [
+          250.0,
+          "Unknown"
+        ]
+      ]
+    }
+  ]
+}

@@ -143,10 +143,19 @@ impl Tracker {
 
     /// Hardware levels persist between runs; the simulator starts full and never
     /// touches the file, so simulated runs can't corrupt the real estimates.
+    ///
+    /// Pass `Settings::effective_backend`: what matters is whether real liquid
+    /// is moving, not whether the bus driving it is local or on the rig's
+    /// server. Levels are estimated from the piston travel this window sees,
+    /// so with several GUIs watching one rig each keeps its own file; they
+    /// agree while all of them are running and drift while one is not.
     pub fn for_backend(backend: Backend) -> Self {
         match backend {
             Backend::Serial => Self::load(),
-            Backend::Simulator => Self::new(Levels::default()),
+            // Never reached: `effective_backend` resolves Remote to one of the
+            // two above. Treated as simulated so a stray value cannot write
+            // over the real estimates.
+            Backend::Simulator | Backend::Remote => Self::new(Levels::default()),
         }
     }
 

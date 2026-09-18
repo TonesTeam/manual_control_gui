@@ -1,14 +1,7 @@
 // Release builds on Windows are GUI apps: no console window behind the main window.
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
-mod app;
-mod bus;
-mod config;
-mod controller_api;
-mod devices;
-mod protocol;
-mod schematic;
-mod tracking;
+use tstand_controler::app;
 
 /// wgpu by default; `TSTAND_RENDERER=glow` switches to OpenGL where wgpu can't start.
 fn renderer() -> eframe::Renderer {

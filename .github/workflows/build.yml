@@ -15,19 +15,23 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             bin: tstand_controler.exe
+            server_bin: tstand_server.exe
             test: true
           - os: macos-latest
             target: aarch64-apple-darwin
             bin: tstand_controler
+            server_bin: tstand_server
             test: true
           # Intel Macs: cross-built on the Apple Silicon runner, so tests can't run.
           - os: macos-latest
             target: x86_64-apple-darwin
             bin: tstand_controler
+            server_bin: tstand_server
             test: false
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             bin: tstand_controler
+            server_bin: tstand_server
             test: true
     runs-on: ${{ matrix.os }}
     steps:
@@ -46,10 +50,24 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+          # libudev: the `can` feature pulls serialport's default features.
+          sudo apt-get install -y libudev-dev
 
       - name: Test
         if: matrix.test
         run: cargo test --target ${{ matrix.target }}
+
+      # The control server builds without a display, which is how the rig's
+      # Raspberry Pi builds it. Breaking that is easy to miss on a desktop.
+      - name: Test headless (server only)
+        if: matrix.test
+        run: cargo test --no-default-features --features can --target ${{ matrix.target }}
+
+      # A display-only build drops the CAN stack, and with it libudev. It still
+      # has to compile: a remote GUI reads temperature from the server.
+      - name: Build GUI without CAN
+        if: matrix.test
+        run: cargo build --no-default-features --features gui --target ${{ matrix.target }}
 
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }}
@@ -57,4 +75,40 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: tstand_controler-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/${{ matrix.bin }}
+          path: |
+            target/${{ matrix.target }}/release/${{ matrix.bin }}
+            target/${{ matrix.target }}/release/${{ matrix.server_bin }}
+
+  # The rig runs on a Raspberry Pi, and only ever needs the server. Cross-built
+  # here so there is a binary to copy over without building on the Pi.
+  server-arm:
+    name: tstand_server aarch64-unknown-linux-gnu
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-server
+
+      # No display libraries: --no-default-features leaves eframe out entirely.
+      - name: Install the cross linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        # Without `can`: cross-compiling it would need an aarch64 libudev in
+        # the sysroot. The Pi builds that variant natively (deploy/deploy.sh).
+        run: cargo build --release --no-default-features --bin tstand_server --target aarch64-unknown-linux-gnu
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tstand_server-aarch64-unknown-linux-gnu
+          path: target/aarch64-unknown-linux-gnu/release/tstand_server

@@ -1,10 +1,12 @@
 use std::collections::VecDeque;
-use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
 
-use crate::bus::{Bus, BusCmd, BusState, DevState, Level, Op};
+use crate::bus::{Bus, BusCmd, BusState, DevState, Level, Op, Wake};
+use crate::rig::{PortUse, Rig, Role, Sensor, SensorAt};
+use crate::routine::{self, Routine};
+use crate::temperature::{TempOp, TempSample, TempStatus, trend_range};
 use crate::config::{Backend, Settings};
 use crate::controller_api::{self as api, Packet, Request, SingleCommand};
 use crate::devices::{DeviceId, Kind, sv02_port_for_slot, sv03_port_for_slot};
@@ -94,8 +96,23 @@ pub struct App {
     available_ports: Vec<String>,
     tab: Tab,
     bus: Bus,
-    api_tx: Sender<(String, Request)>,
-    api_rx: Receiver<api::Reply>,
+    /// Generation of the server settings already folded into `settings`, so a
+    /// reconnect does not fight the user for the Settings fields every frame.
+    adopted_server_settings: u64,
+    /// Backend the level tracker was built for; it persists levels for real
+    /// hardware and starts fresh for the simulator.
+    tracker_backend: Backend,
+    /// How much of the temperature trend to show, in seconds. A fixed span
+    /// rather than "whatever has been collected", so the trace scrolls through
+    /// a stable axis instead of the axis rescaling under it.
+    temp_window_secs: f64,
+    /// Setpoint being typed, before it is sent to the board.
+    temp_setpoint: f32,
+    temp_tolerance: f32,
+    /// Setpoint the board last reported, so the box follows it until edited.
+    temp_setpoint_seen: Option<f32>,
+    /// True once the band has been typed in, so the board stops overwriting it.
+    temp_tolerance_edited: bool,
     selected: Option<DeviceId>,
     click_to_actuate: bool,
     valve_confirm: Option<(DeviceId, u16)>,
@@ -114,6 +131,14 @@ pub struct App {
     started: Instant,
     demo: VecDeque<(DeviceId, Op)>,
     demo_wait: Option<(DeviceId, Instant)>,
+    /// Where the liquid is, tracked from piston travel and sensor edges.
+    liquid: crate::fluidics::Tracker,
+    /// The prime-and-calibrate run, while one is going.
+    run: Option<Routine>,
+    /// Settling delay after the run's last command, as for the demo.
+    run_sent: Option<Instant>,
+    /// What the last run ended with, kept on screen after it finishes.
+    run_result: Option<Result<routine::Report, String>>,
     layout: schematic::Layout,
     saved_layout: schematic::Layout,
     edit_layout: bool,
@@ -123,15 +148,17 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let settings = Settings::load();
-        let bus = Bus::spawn(cc.egui_ctx.clone(), settings.clone());
-        let (api_tx, api_rx) = api::spawn(cc.egui_ctx.clone());
-        let demo = if std::env::args().any(|a| a == "--demo") && settings.backend == Backend::Simulator {
+        let ctx = cc.egui_ctx.clone();
+        let bus = Bus::spawn(Wake::new(move || ctx.request_repaint()), settings.clone());
+        let demo = if std::env::args().any(|a| a == "--demo")
+            && settings.effective_backend() == Backend::Simulator
+        {
             demo_steps()
         } else {
             VecDeque::new()
         };
         let layout = schematic::Layout::load();
-        let tracker = Tracker::for_backend(settings.backend);
+        let tracker = Tracker::for_backend(settings.effective_backend());
         Self {
             saved_layout: layout.clone(),
             layout,
@@ -139,13 +166,22 @@ impl App {
             layout_message: None,
             demo,
             demo_wait: None,
+            liquid: crate::fluidics::Tracker::default(),
+            run: None,
+            run_sent: None,
+            run_result: None,
             draft: settings.clone(),
+            tracker_backend: settings.effective_backend(),
             settings,
             available_ports: list_ports(),
+            adopted_server_settings: 0,
+            temp_window_secs: TEMP_TREND_SECS,
+            temp_setpoint: 25.0,
+            temp_tolerance: 0.5,
+            temp_setpoint_seen: None,
+            temp_tolerance_edited: false,
             tab: Tab::Monitor,
             bus,
-            api_tx,
-            api_rx,
             selected: Some(DeviceId::Pp01),
             click_to_actuate: false,
             valve_confirm: None,
@@ -164,11 +200,11 @@ impl App {
     }
 
     fn api(&self, request: Request) {
-        let _ = self.api_tx.send((self.settings.controller_url.clone(), request));
+        self.bus.api(&self.settings.controller_url, request);
     }
 
     fn drain_api(&mut self) {
-        while let Ok(reply) = self.api_rx.try_recv() {
+        while let Some(reply) = self.bus.next_api_reply() {
             let quiet = reply.request.is_poll();
             match &reply.result {
                 Ok((code, body)) => {
@@ -215,6 +251,98 @@ impl App {
         }
     }
 
+    /// Advances the prime-and-calibrate run.
+    ///
+    /// The decision lives in [`crate::routine`]; this only reports what the
+    /// rig is doing and posts what comes back. Every command it sends is a
+    /// bounded move, so losing this window mid-run leaves the pump stopped at
+    /// the end of its current chunk rather than still travelling.
+    fn step_routine(&mut self, state: &BusState) {
+        let Some(run) = self.run.as_mut() else { return };
+        // Same settling delay the demo uses: a device reports its old status
+        // for a poll or two after being given a command.
+        let pump = state.dev(DeviceId::Pp01);
+        let busy = |d: &crate::bus::DeviceLive| d.target.is_some() || matches!(d.status, Some(0x04 | 0xFE));
+        let fresh = self.run_sent.is_some_and(|t| t.elapsed() < Duration::from_millis(700));
+        let settled = !fresh
+            && !busy(pump)
+            && !busy(state.dev(DeviceId::Sv01))
+            && !busy(state.dev(DeviceId::Sv02));
+        let plan = run.plan();
+        let obs = routine::Observation {
+            pump: pump.value,
+            settled,
+            // The bus clock, so a reading's age is measured against the rig
+            // rather than against however often this window repaints.
+            now: state.now(),
+            edge_wet: state.sensors.channel(plan.edge_sensor),
+            slot_wet: state.sensors.channel(plan.slot_sensor),
+            first_wet: state.sensors.channel(plan.first_sensor),
+        };
+        match run.step(obs) {
+            routine::Action::Wait => {}
+            routine::Action::Send(id, op) => {
+                // Sent one at a time and waited on, including the homing: the
+                // order the valves and the pump are reset in is the run's
+                // business, not a broadcast.
+                self.bus.device(id, op);
+                self.run_sent = Some(Instant::now());
+            }
+            routine::Action::Finished(report) => {
+                self.run = None;
+                self.run_sent = None;
+                // The run exists to measure these; keep them, or the next run
+                // starts as ignorant as this one did.
+                let ul = self.settings.pp01_ul_per_step;
+                self.liquid.model.record_prime(
+                    report.to_first_steps.map(|s| s as f32 * ul),
+                    report.to_edge_ul(ul),
+                    report.edge_to_slot_ul(ul),
+                );
+                self.liquid.flush();
+                self.run_result = Some(Ok(report));
+            }
+            routine::Action::Abort(why) => {
+                self.run = None;
+                self.run_sent = None;
+                // Whatever went wrong, stop moving liquid.
+                self.bus.send(BusCmd::StopAll);
+                self.run_result = Some(Err(why));
+            }
+        }
+    }
+
+    /// Folds this frame's pump position and sensor readings into the liquid
+    /// model, and saves it now and then.
+    fn track_liquid(&mut self, state: &BusState) {
+        let rig = &self.settings.rig;
+        let channels: Vec<(crate::fluidics::Landmark, u8)> = [
+            (SensorAt::Inline1, crate::fluidics::Landmark::S1),
+            (SensorAt::Inline2, crate::fluidics::Landmark::S2),
+            (SensorAt::Slot, crate::fluidics::Landmark::Slot),
+        ]
+        .iter()
+        .filter_map(|(at, landmark)| rig.sensor_at(*at).map(|s| (*landmark, s.channel)))
+        .collect();
+        let sensors: [Option<bool>; 6] = std::array::from_fn(|i| state.sensors.channel(i as u8));
+        let waste = rig.ports.iter().find(|p| p.role == Role::Waste).map(|p| p.port).unwrap_or(9);
+        let fill = rig.ports.iter().find(|p| p.role == Role::SlotFill).map(|p| p.port).unwrap_or(10);
+        let air = rig.ports.iter().find(|p| p.role == Role::Air).map(|p| p.port);
+        self.liquid.update(
+            state.dev(DeviceId::Pp01).value,
+            self.settings.pp01_ul_per_step,
+            state.dev(DeviceId::Pp01).solenoid_input,
+            state.dev(DeviceId::Sv01).value,
+            state.dev(DeviceId::Sv02).value,
+            waste,
+            fill,
+            air,
+            &sensors,
+            &channels,
+        );
+        self.liquid.maybe_save();
+    }
+
     /// Slot descriptions from controller_v2 (`Idle`, `Missing`, a step name), only while it answers.
     fn slot_descriptions(&self) -> [Option<String>; 6] {
         let slots = self.ctrl.slots.as_ref().and_then(|v| v.as_array()).filter(|_| self.ctrl.reachable == Some(true));
@@ -249,13 +377,21 @@ impl App {
             }
             ui.separator();
 
-            let (dot, text) = match (state.backend, state.connected) {
-                (Backend::Simulator, true) => (Color32::from_rgb(160, 120, 230), "Simulator".to_string()),
-                (Backend::Serial, true) => (Color32::from_rgb(60, 180, 90), format!("RS485 {}", self.settings.port)),
-                (_, false) => (Color32::from_rgb(220, 70, 70), "Disconnected".to_string()),
+            let (dot, text) = match (&state.remote, state.backend, state.connected) {
+                (Some(host), Backend::Simulator, true) => {
+                    (Color32::from_rgb(160, 120, 230), format!("{host} · simulator"))
+                }
+                (Some(host), _, true) => (Color32::from_rgb(60, 180, 90), format!("{host} · RS485 {}", self.settings.port)),
+                (Some(host), _, false) => (Color32::from_rgb(220, 70, 70), format!("{host} · no link")),
+                (None, Backend::Simulator, true) => (Color32::from_rgb(160, 120, 230), "Simulator".to_string()),
+                (None, _, true) => (Color32::from_rgb(60, 180, 90), format!("RS485 {}", self.settings.port)),
+                (None, _, false) => (Color32::from_rgb(220, 70, 70), "Disconnected".to_string()),
             };
             status_dot(ui, dot);
-            ui.label(text);
+            ui.label(text).on_hover_text(match &state.remote {
+                Some(host) => format!("The pumps and valves are on {host}; this window is a view of them."),
+                None => "The pumps and valves are on this machine's bus.".to_string(),
+            });
             let online = state.devices.iter().filter(|d| d.online).count();
             ui.label(format!("{online}/5 online"));
             ui.label(RichText::new(format!("cycle {:.0} ms", state.cycle_ms)).weak());
@@ -302,6 +438,345 @@ impl App {
 
     // ───────────────────────────── monitor ─────────────────────────────
 
+    /// The wired optical detectors: what they say, and the raw value behind it.
+    ///
+    /// The raw reading is shown because the state bit cannot distinguish a
+    /// detector solidly immersed from one that has just crossed its threshold.
+    /// A settled reading holds the same number sample after sample; a front or
+    /// a bubble makes it move. No attempt is made here to turn the number into
+    /// a state — the two in-line detectors on this rig cross in opposite
+    /// directions, so there is no single rule to apply.
+    fn sensor_panel(&mut self, ui: &mut egui::Ui, state: &BusState) {
+        ui.horizontal(|ui| {
+            ui.heading(RichText::new("Liquid sensors").size(17.0));
+            if !state.sensors.connected {
+                badge(ui, "OFFLINE", Color32::from_rgb(220, 70, 70), 13.0);
+            }
+        });
+        if let Some(e) = &state.sensors.error {
+            ui.colored_label(Color32::from_rgb(220, 90, 90), e);
+            return;
+        }
+        if self.settings.rig.sensors.is_empty() {
+            ui.label(RichText::new("No detectors configured (Settings → Rig).").small().weak());
+            return;
+        }
+        egui::Grid::new("sensor_table").num_columns(4).striped(true).spacing([12.0, 5.0]).show(ui, |ui| {
+            for sensor in &self.settings.rig.sensors {
+                ui.label(RichText::new(&sensor.name).size(15.0).strong());
+                let reading = crate::sensors::Reading::of(&state.sensors, sensor.channel);
+                let (text, colour) = match reading {
+                    crate::sensors::Reading::Liquid => ("LIQUID", Color32::from_rgb(64, 150, 240)),
+                    crate::sensors::Reading::Dry => ("dry", Color32::from_rgb(140, 150, 165)),
+                    crate::sensors::Reading::Unknown => ("—", Color32::from_rgb(110, 115, 125)),
+                };
+                badge(ui, text, colour, 13.0);
+                match state.sensors.adc_at(sensor.channel) {
+                    Some(raw) => ui.label(RichText::new(format!("raw {raw:>3}")).monospace().size(14.0)),
+                    None => ui.label(RichText::new("raw —").monospace().size(14.0).weak()),
+                };
+                ui.label(
+                    RichText::new(match sensor.at {
+                        SensorAt::Inline1 => "pump → coil",
+                        SensorAt::Inline2 => "coil → SV02",
+                        SensorAt::Slot => "slot feed",
+                    })
+                    .small()
+                    .weak(),
+                );
+                ui.end_row();
+            }
+        });
+        if let (Some(max), Some(min)) = (state.sensors.max_threshold, state.sensors.min_threshold) {
+            ui.label(
+                RichText::new(format!(
+                    "board thresholds {max} / {min} · a settled reading holds still, a front or a bubble moves it",
+                ))
+                .small()
+                .weak(),
+            );
+        }
+    }
+
+    /// Prime the wash line and measure what it holds.
+    ///
+    /// Deliberately a button rather than something that runs on its own: it
+    /// moves real liquid, so it starts when someone is watching the rig.
+    fn prime_panel(&mut self, ui: &mut egui::Ui, state: &BusState) {
+        let running = self.run.is_some();
+        ui.horizontal(|ui| {
+            ui.heading(RichText::new("Prime & calibrate").size(17.0));
+            if let Some(run) = &self.run {
+                badge(ui, run.stage().label(), Color32::from_rgb(64, 150, 240), 13.0);
+            }
+        });
+
+        let plan = routine::Plan::for_rig(&self.settings.rig);
+        let ready = state.connected && state.sensors.connected && !running;
+        match &plan {
+            Ok(p) => {
+                if !running {
+                    ui.label(
+                        RichText::new(format!(
+                            "Draws wash from SV01 port {}, pushes it to S2, then on into the slot through SV02 port {}, \
+                             and reports what each leg took. Approaches at {} rpm and creeps the last of it at {}, \
+                             the speeds controller_v2 moves liquid at. Stops on its own after {} µL a leg.",
+                            p.wash_port,
+                            p.fill_port,
+                            p.coarse_speed,
+                            p.fine_speed,
+                            (p.cap_steps as f32 * self.settings.pp01_ul_per_step).round(),
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                }
+            }
+            Err(why) => {
+                ui.colored_label(Color32::from_rgb(220, 160, 40), why);
+            }
+        }
+
+        if let Some(run) = &self.run {
+            ui.add(
+                egui::ProgressBar::new(run.leg_fraction())
+                    .desired_width(ui.available_width().min(300.0))
+                    .text(RichText::new(run.stage().label()).size(12.0)),
+            );
+        }
+
+        ui.horizontal(|ui| {
+            let start = egui::Button::new(RichText::new("Prime & calibrate").strong());
+            let response = ui.add_enabled(ready && plan.is_ok(), start);
+            let response = if !state.sensors.connected {
+                response.on_disabled_hover_text("The optical sensor board is not answering; this run stops on its sensors.")
+            } else {
+                response.on_hover_text("Moves real liquid. Watch the rig while it runs.")
+            };
+            if response.clicked()
+                && let Ok(p) = plan
+            {
+                self.run_result = None;
+                self.run_sent = None;
+                self.run = Some(Routine::new(p));
+            }
+            if ui
+                .add_enabled(running, egui::Button::new(RichText::new("Abort").color(Color32::from_rgb(225, 80, 80))))
+                .clicked()
+            {
+                self.run = None;
+                self.run_sent = None;
+                self.bus.send(BusCmd::StopAll);
+                self.run_result = Some(Err("aborted".into()));
+            }
+        });
+
+        match &self.run_result {
+            Some(Ok(report)) => {
+                let ul = self.settings.pp01_ul_per_step;
+                let bore = self.liquid.model.bore_id_mm;
+                let mm = |v: f32| crate::fluidics::length_mm(v, bore);
+                if let Some(first) = report.to_first_steps.map(|s| s as f32 * ul) {
+                    ui.label(RichText::new(format!("PP01 → S1: {first:.0} µL · {:.0} mm", mm(first))).size(14.0));
+                    let rest = report.to_edge_ul(ul) - first;
+                    ui.label(RichText::new(format!("S1 → S2: {rest:.0} µL · {:.0} mm", mm(rest))).size(14.0));
+                }
+                ui.label(
+                    RichText::new(format!(
+                        "PP01 → S2: {:.0} µL · {:.0} mm ({} steps{})",
+                        report.to_edge_ul(ul),
+                        mm(report.to_edge_ul(ul)),
+                        report.to_edge_steps,
+                        if report.edge_precise { "" } else { ", coarse only" },
+                    ))
+                    .size(14.0),
+                );
+                let slot = format!(
+                    "S2 → slot: {:.0} µL · {:.0} mm ({} steps)",
+                    report.edge_to_slot_ul(ul),
+                    mm(report.edge_to_slot_ul(ul)),
+                    report.edge_to_slot_steps
+                );
+                if report.slot_timed_out {
+                    ui.colored_label(
+                        Color32::from_rgb(220, 160, 40),
+                        format!("{slot} — the slot sensor never wetted, so this is how far it got"),
+                    );
+                } else {
+                    ui.label(RichText::new(slot).size(14.0));
+                }
+                // A sensor changing its mind with the piston stopped is
+                // something physically moving past it.
+                match report.bubbles_seen {
+                    0 => ui.label(RichText::new("no bubbles seen").small().weak()),
+                    n => ui.colored_label(
+                        Color32::from_rgb(220, 160, 40),
+                        format!("{n} sensor contradiction(s) with the piston still — bubbles; figures are approximate"),
+                    ),
+                };
+            }
+            Some(Err(why)) => {
+                ui.colored_label(Color32::from_rgb(225, 80, 80), why);
+            }
+            None => {}
+        }
+    }
+
+    /// The Peltier slot-temperature board: what it reads, and the two things
+    /// worth changing from here — the setpoint and whether the PID owns the
+    /// output. Gains and autotune stay with the board's own tooling.
+    fn temperature_panel(&mut self, ui: &mut egui::Ui, state: &BusState) {
+        let t = &state.temp;
+        let status = t.status();
+        let slot = self.settings.rig.only_slot();
+        let title = match slot {
+            Some(n) => format!("Temperature — slot {n}"),
+            None => "Temperature".to_string(),
+        };
+        ui.horizontal(|ui| {
+            ui.heading(RichText::new(title).size(17.0));
+            badge(ui, status.label(), temp_status_color(status), 13.0);
+        });
+
+        if !t.enabled {
+            ui.label(
+                RichText::new("No temperature board configured. Settings → Temperature.")
+                    .small()
+                    .weak(),
+            );
+            return;
+        }
+        if let Some(e) = &t.error {
+            ui.colored_label(Color32::from_rgb(220, 90, 90), e);
+        }
+
+        // The reading, big enough to read across a bench.
+        ui.horizontal(|ui| {
+            let reading = t.temperature_c.map(|c| format!("{c:.2} °C")).unwrap_or_else(|| "—".into());
+            ui.label(RichText::new(reading).size(34.0).strong());
+            ui.vertical(|ui| {
+                let target = t.setpoint_c.map(|c| format!("target {c:.2} °C")).unwrap_or_else(|| "no target".into());
+                ui.label(RichText::new(target).size(15.0));
+                if let (Some(err), Some(tol)) = (t.error_c(), t.tolerance_c) {
+                    ui.label(
+                        RichText::new(format!("{err:+.2} °C to go · band ±{tol:.2}"))
+                            .size(13.0)
+                            .weak(),
+                    );
+                }
+            });
+        });
+
+        if t.sensor_fault {
+            ui.colored_label(
+                Color32::from_rgb(225, 80, 80),
+                "RTD fault: the reading is not trustworthy and the board will not regulate.",
+            );
+        }
+        if !t.active_faults.is_empty() {
+            ui.colored_label(Color32::from_rgb(225, 80, 80), format!("Active: {}", t.active_faults));
+        }
+        if !t.latched_faults.is_empty() {
+            ui.colored_label(
+                Color32::from_rgb(220, 160, 40),
+                format!("Latched since last clear: {}", t.latched_faults),
+            );
+        }
+
+        temp_trend(ui, &t.history, state.now(), self.temp_window_secs);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("window").small().weak());
+            for minutes in [5.0f64, 10.0] {
+                let secs = minutes * 60.0;
+                let on = (self.temp_window_secs - secs).abs() < 1.0;
+                if ui.selectable_label(on, RichText::new(format!("{minutes:.0} min")).small()).clicked() {
+                    self.temp_window_secs = secs;
+                }
+            }
+        });
+
+        egui::Grid::new("temp_readout").num_columns(2).spacing([14.0, 4.0]).show(ui, |ui| {
+            // Signed duty: the H-bridge reverses to cool, so the sign is the
+            // difference between heating and cooling, not a rounding artefact.
+            param(
+                ui,
+                "Bridge duty",
+                t.duty_pct
+                    .map(|d| format!("{d:+.1} % ({})", if d > 0.0 { "heating" } else if d < 0.0 { "cooling" } else { "idle" }))
+                    .unwrap_or_else(|| "—".into()),
+            );
+            param(ui, "Current", t.current_a.map(|a| format!("{a:.2} A")).unwrap_or_else(|| "—".into()));
+            if t.autotuning {
+                param(ui, "Autotune", "running".to_string());
+            }
+        });
+
+        // Follow the board's setpoint until the operator starts typing, so the
+        // box shows what is actually set rather than a stale local guess.
+        if t.setpoint_c != self.temp_setpoint_seen {
+            if let Some(c) = t.setpoint_c {
+                self.temp_setpoint = c;
+            }
+            self.temp_setpoint_seen = t.setpoint_c;
+        }
+        if let Some(tol) = t.tolerance_c
+            && (tol - self.temp_tolerance).abs() > 0.001
+            && !self.temp_tolerance_edited
+        {
+            self.temp_tolerance = tol;
+        }
+
+        let live = t.connected;
+        ui.add_enabled_ui(live, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Set");
+                ui.add(
+                    egui::DragValue::new(&mut self.temp_setpoint)
+                        .range(TEMP_MIN_C..=TEMP_MAX_C)
+                        .speed(0.1)
+                        .suffix(" °C"),
+                );
+                if ui.button("Apply").on_hover_text("Send the setpoint to the board").clicked() {
+                    self.bus.send(BusCmd::Temp(TempOp::SetTemperature(self.temp_setpoint)));
+                }
+                ui.label("±");
+                let tol = ui.add(
+                    egui::DragValue::new(&mut self.temp_tolerance).range(0.05..=10.0).speed(0.05).suffix(" °C"),
+                );
+                if tol.changed() {
+                    self.temp_tolerance_edited = true;
+                }
+                if ui.add_enabled(self.temp_tolerance_edited, egui::Button::new("Set band")).clicked() {
+                    self.bus.send(BusCmd::Temp(TempOp::SetTolerance(self.temp_tolerance)));
+                    self.temp_tolerance_edited = false;
+                }
+            });
+            ui.horizontal(|ui| {
+                if t.pid_running {
+                    let stop = egui::Button::new(RichText::new("Stop holding").strong())
+                        .fill(Color32::from_rgb(150, 60, 40));
+                    if ui.add(stop).on_hover_text("Stop regulating and brake the bridge").clicked() {
+                        self.bus.send(BusCmd::Temp(TempOp::StopPid));
+                    }
+                } else if ui
+                    .add_enabled(!t.sensor_fault, egui::Button::new(RichText::new("Hold temperature").strong()))
+                    .on_hover_text("Hand the output to the board's PID")
+                    .on_disabled_hover_text("The board refuses to regulate while the RTD is in fault")
+                    .clicked()
+                {
+                    self.bus.send(BusCmd::Temp(TempOp::StartPid));
+                }
+                if ui
+                    .add_enabled(t.has_latched(), egui::Button::new("Clear faults"))
+                    .on_hover_text("Drop the latched fault history")
+                    .clicked()
+                {
+                    self.bus.send(BusCmd::Temp(TempOp::ClearErrors));
+                }
+            });
+        });
+    }
+
     fn monitor_side(&mut self, ui: &mut egui::Ui, state: &BusState, fluid: &FluidView) {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.heading("Devices");
@@ -318,7 +793,10 @@ impl App {
                         (_, None) => "—".to_string(),
                         (Kind::Pump { .. }, Some(v)) => format!("{v} st · {:.0} µL", v as f32 * self.settings.ul_per_step(id)),
                         (Kind::Valve { .. }, Some(0)) => "reset".to_string(),
-                        (Kind::Valve { .. }, Some(p)) => format!("port {p} · {}", id.port_label(p).split(" (").next().unwrap_or("")),
+                        (Kind::Valve { .. }, Some(p)) => {
+                            let label = self.settings.rig.port_label(id, p);
+                            format!("port {p} · {}", label.split(" (").next().unwrap_or(""))
+                        }
                     };
                     ui.vertical(|ui| {
                         ui.label(RichText::new(value).size(17.0));
@@ -334,7 +812,15 @@ impl App {
                 let descriptions = self.slot_descriptions();
                 egui::Grid::new("slot_table").num_columns(3).striped(true).spacing([12.0, 6.0]).show(ui, |ui| {
                     for (i, (st, vol)) in fluid.slots.iter().enumerate() {
-                        ui.label(RichText::new(format!("Slot {}", i + 1)).size(15.0).strong());
+                        let slot = i as u16 + 1;
+                        if !self.settings.rig.slot_fitted(slot) {
+                            continue;
+                        }
+                        let name = match self.settings.rig.slot_sensor_name() {
+                            Some(sensor) => format!("Slot {slot} ({sensor})"),
+                            None => format!("Slot {slot}"),
+                        };
+                        ui.label(RichText::new(name).size(15.0).strong());
                         badge(ui, st.label(), st.color(), 13.0);
                         let note = descriptions[i].as_deref().filter(|d| !d.eq_ignore_ascii_case("idle")).map(|d| format!(" · {d}")).unwrap_or_default();
                         ui.label(RichText::new(format!("~{vol:.0} µL{note}")).size(14.0));
@@ -344,6 +830,9 @@ impl App {
                 ui.add_space(4.0);
                 egui::Grid::new("bottle_table").num_columns(3).striped(true).spacing([12.0, 6.0]).show(ui, |ui| {
                     for (i, (st, ml)) in fluid.bottles.iter().enumerate() {
+                        if !self.settings.rig.bottle_in_use(i as u16 + 1) {
+                            continue;
+                        }
                         let cap = BOTTLE_CAPACITY_ML[i];
                         ui.label(RichText::new(format!("C{}", i + 1)).size(15.0).strong());
                         badge(ui, st.label(), st.color(), 13.0);
@@ -385,6 +874,12 @@ impl App {
                 ui.label(RichText::new(msg).small());
             }
             ui.separator();
+            self.sensor_panel(ui, state);
+            ui.separator();
+            self.prime_panel(ui, state);
+            ui.separator();
+            self.temperature_panel(ui, state);
+            ui.separator();
 
             if let Some(id) = self.selected {
                 ui.heading(format!("{} — {}", id.tag(), id.role()));
@@ -420,7 +915,7 @@ impl App {
             });
             let (headline, detail) = match d.value {
                 Some(0) => ("Reset".to_string(), "common port closed".to_string()),
-                Some(p) => (format!("Port {p}"), id.port_label(p).to_string()),
+                Some(p) => (format!("Port {p}"), self.settings.rig.port_label(id, p)),
                 None => ("—".to_string(), "position unknown".to_string()),
             };
             ui.label(RichText::new(headline).size(34.0).strong());
@@ -431,14 +926,25 @@ impl App {
             });
         });
         let cols: u16 = if ports == 16 { 2 } else { 1 };
+        let rig = self.settings.rig.clone();
         egui::Grid::new(("ports", id)).num_columns(cols as usize * 2).spacing([6.0, 4.0]).show(ui, |ui| {
             for p in 1..=ports {
                 let current = d.value == Some(p);
+                let allowed = rig.port_allowed(id, p);
+                let plumbed = rig.port_plumbed(id, p);
                 let btn = egui::Button::new(RichText::new(format!("{p:>2}")).monospace()).selected(current);
-                if ui.add(btn).clicked() {
+                let response = ui.add_enabled(allowed, btn);
+                let response = match rig.blocked_reason(id, p) {
+                    Some(why) => response.on_disabled_hover_text(why),
+                    None => response,
+                };
+                if response.clicked() {
                     self.bus.device(id, Op::ValveTo(p));
                 }
-                ui.label(RichText::new(id.port_label(p)).small());
+                // A capped line stays listed but reads as absent, so the port
+                // numbering still matches the valve in front of you.
+                let label = RichText::new(rig.port_label(id, p)).small();
+                ui.label(if plumbed { label } else { label.weak().strikethrough() });
                 if p % cols == 0 {
                     ui.end_row();
                 }
@@ -595,7 +1101,7 @@ impl App {
 
     fn monitor_central(&mut self, ui: &mut egui::Ui, state: &BusState, fluid: &FluidView) {
         let time = self.started.elapsed().as_secs_f64();
-        let resp = schematic::show(ui, state, &self.settings, fluid, self.selected, time, &mut self.layout, self.edit_layout);
+        let resp = schematic::show(ui, state, &self.settings, fluid, &self.liquid.model, self.selected, time, &mut self.layout, self.edit_layout);
         if resp.layout_changed {
             self.layout_message = None;
         }
@@ -625,6 +1131,23 @@ impl App {
 
     // ───────────────────────────── right-click menu ─────────────────────────────
 
+    /// A menu entry that switches a valve, greyed out when the rig says that
+    /// port is capped. The guard on the bus would refuse it anyway; this says
+    /// so before the click rather than after.
+    fn port_menu_button(&mut self, ui: &mut egui::Ui, id: DeviceId, port: u16, text: String) -> bool {
+        let allowed = self.settings.rig.port_allowed(id, port);
+        let response = ui.add_enabled(allowed, egui::Button::new(text));
+        let response = match self.settings.rig.blocked_reason(id, port) {
+            Some(why) => response.on_disabled_hover_text(why),
+            None => response,
+        };
+        if response.clicked() {
+            self.bus.device(id, Op::ValveTo(port));
+            return true;
+        }
+        false
+    }
+
     fn schematic_menu(&mut self, ui: &mut egui::Ui, target: Target, state: &BusState) {
         ui.set_min_width(240.0);
         let heading = |ui: &mut egui::Ui, text: String| {
@@ -633,9 +1156,16 @@ impl App {
         };
         match target {
             Target::Port(id, port) => {
-                heading(ui, format!("{} port {port} · {}", id.tag(), id.port_label(port)));
+                heading(ui, format!("{} port {port} · {}", id.tag(), self.settings.rig.port_label(id, port)));
                 let current = state.dev(id).value == Some(port);
-                if ui.add_enabled(!current, egui::Button::new(format!("Switch {} to port {port}", id.tag()))).clicked() {
+                let allowed = self.settings.rig.port_allowed(id, port);
+                let button = egui::Button::new(format!("Switch {} to port {port}", id.tag()));
+                let response = ui.add_enabled(!current && allowed, button);
+                let response = match self.settings.rig.blocked_reason(id, port) {
+                    Some(why) => response.on_disabled_hover_text(why),
+                    None => response,
+                };
+                if response.clicked() {
                     self.bus.device(id, Op::ValveTo(port));
                 }
                 ui.separator();
@@ -652,12 +1182,8 @@ impl App {
             Target::Slot(n) => {
                 heading(ui, format!("Slot {n}"));
                 let (fill, drain) = (sv02_port_for_slot(n), sv03_port_for_slot(n));
-                if ui.button(format!("Select fill path · SV02 → port {fill}")).clicked() {
-                    self.bus.device(DeviceId::Sv02, Op::ValveTo(fill));
-                }
-                if ui.button(format!("Select drain path · SV03 → port {drain}")).clicked() {
-                    self.bus.device(DeviceId::Sv03, Op::ValveTo(drain));
-                }
+                self.port_menu_button(ui, DeviceId::Sv02, fill, format!("Select fill path · SV02 → port {fill}"));
+                self.port_menu_button(ui, DeviceId::Sv03, drain, format!("Select drain path · SV03 → port {drain}"));
                 ui.separator();
                 if ui.button(format!("New protocol for slot {n}…")).clicked() {
                     self.form.slot = n;
@@ -680,15 +1206,19 @@ impl App {
             }
             Target::Bottle(c) => {
                 heading(ui, format!("C{c} · {} external reagent", if c <= 3 { "1 L" } else { "0.5 L" }));
-                if ui
-                    .button(format!("Connect to PP01 via SV02 port {c}"))
-                    .on_hover_text("Solenoid → output (coil side), then SV02 → this bottle's port")
-                    .clicked()
+                // The solenoid only moves if the port is reachable, so the
+                // order is: check the port, then set the side, then switch.
+                if self.settings.rig.port_allowed(DeviceId::Sv02, c)
+                    && ui
+                        .button(format!("Connect to PP01 via SV02 port {c}"))
+                        .on_hover_text("Solenoid → output (coil side), then SV02 → this bottle's port")
+                        .clicked()
                 {
                     self.bus.device(DeviceId::Pp01, Op::SolenoidInput(false));
                     self.bus.device(DeviceId::Sv02, Op::ValveTo(c));
                 }
                 if c <= 3
+                    && self.settings.rig.port_allowed(DeviceId::Sv01, c)
                     && ui
                         .button(format!("Connect to PP01 via SV01 port {c}"))
                         .on_hover_text("Solenoid → input (SV01 side), then SV01 → this bottle's port")
@@ -717,10 +1247,8 @@ impl App {
                 });
             }
             Target::Tag(_, id, port) => {
-                heading(ui, format!("{} · {} port {port}", id.port_label(port), id.tag()));
-                if ui.button(format!("Switch {} to port {port}", id.tag())).clicked() {
-                    self.bus.device(id, Op::ValveTo(port));
-                }
+                heading(ui, format!("{} · {} port {port}", self.settings.rig.port_label(id, port), id.tag()));
+                self.port_menu_button(ui, id, port, format!("Switch {} to port {port}", id.tag()));
             }
             Target::Part(key) => heading(ui, part_title(key)),
             Target::Background => {
@@ -755,10 +1283,18 @@ impl App {
     fn valve_menu(&mut self, ui: &mut egui::Ui, id: DeviceId, state: &BusState) {
         let Kind::Valve { ports } = id.kind() else { return };
         let current = state.dev(id).value;
+        let rig = self.settings.rig.clone();
         ui.menu_button("Switch to port", |ui| {
             for p in 1..=ports {
-                let label = format!("{p:>2} · {}", id.port_label(p));
-                if ui.add(egui::Button::new(label).selected(current == Some(p))).clicked() {
+                let label = format!("{p:>2} · {}", rig.port_label(id, p));
+                let allowed = rig.port_allowed(id, p);
+                let button = egui::Button::new(label).selected(current == Some(p));
+                let response = ui.add_enabled(allowed, button);
+                let response = match rig.blocked_reason(id, p) {
+                    Some(why) => response.on_disabled_hover_text(why),
+                    None => response,
+                };
+                if response.clicked() {
                     self.bus.device(id, Op::ValveTo(p));
                 }
             }
@@ -1302,14 +1838,61 @@ impl App {
     // ───────────────────────────── settings ─────────────────────────────
 
     fn settings_tab(&mut self, ui: &mut egui::Ui) {
+        // The server sends its port list on connect, which may land after the
+        // handshake; pick it up while this tab is open rather than making the
+        // user press Refresh for a list that has already arrived.
+        if self.bus.is_remote() {
+            let ports = self.bus.serial_ports();
+            if !ports.is_empty() && ports != self.available_ports {
+                self.available_ports = ports;
+            }
+        }
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let s = &mut self.draft;
+            let remote = s.backend == Backend::Remote;
             ui.heading("Connection");
             ui.horizontal(|ui| {
-                ui.radio_value(&mut s.backend, Backend::Simulator, "Simulator");
-                ui.radio_value(&mut s.backend, Backend::Serial, "RS485 serial");
+                ui.radio_value(&mut s.backend, Backend::Simulator, "Simulator")
+                    .on_hover_text("No hardware: simulated devices with datasheet timing, on this machine");
+                ui.radio_value(&mut s.backend, Backend::Serial, "RS485 serial")
+                    .on_hover_text("Drive an adapter plugged into this machine");
+                ui.radio_value(&mut s.backend, Backend::Remote, "Remote server")
+                    .on_hover_text("Let tstand_server drive the rig; this window only watches and commands");
             });
-            ui.add_enabled_ui(s.backend == Backend::Serial, |ui| {
+
+            if remote {
+                ui.horizontal(|ui| {
+                    ui.label("Server");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut s.server_host)
+                            .hint_text("tonespi.local:7373")
+                            .desired_width(200.0),
+                    );
+                    ui.label("Token");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut s.server_token)
+                            .password(true)
+                            .hint_text("--token on the server")
+                            .desired_width(160.0),
+                    );
+                });
+                ui.label(
+                    RichText::new(
+                        "The adapter stays on the server. Port, addresses and calibration below are the server's, \
+                         read from it when this window connects; applying writes them back to it.",
+                    )
+                    .weak(),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Server drives");
+                    ui.radio_value(&mut s.server_backend, Backend::Simulator, "Simulator");
+                    ui.radio_value(&mut s.server_backend, Backend::Serial, "RS485 serial");
+                });
+            }
+
+            // The serial fields describe whichever machine holds the adapter.
+            let serial_side = if remote { s.server_backend } else { s.backend };
+            ui.add_enabled_ui(serial_side == Backend::Serial, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Port");
                     egui::ComboBox::from_id_salt("port_combo")
@@ -1320,9 +1903,12 @@ impl App {
                             }
                         });
                     if ui.button("Refresh").clicked() {
-                        self.available_ports = list_ports();
+                        self.available_ports = self.bus.serial_ports();
                     }
                     ui.text_edit_singleline(&mut s.port);
+                    if remote {
+                        ui.label(RichText::new("on the server").weak());
+                    }
                 });
                 ui.horizontal(|ui| {
                     ui.label("Baud rate");
@@ -1397,22 +1983,183 @@ impl App {
             });
 
             ui.add_space(8.0);
+            ui.heading("Temperature (CAN)");
+            ui.checkbox(&mut s.temp_enabled, "Drive the Peltier slot-temperature board");
+            ui.add_enabled_ui(s.temp_enabled, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("CAN adapter");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut s.temp_port)
+                            .hint_text("/dev/ttyACM0 — blank auto-detects")
+                            .desired_width(240.0),
+                    );
+                    if remote {
+                        ui.label(RichText::new("on the server").weak());
+                    }
+                });
+            });
+            ui.label(
+                RichText::new(
+                    "The board runs its own PID; this sets the target and starts or stops it. \
+                     The adapter is shared with the optical sensors, so only one program may hold it — \
+                     stop controller_v2 before enabling this.",
+                )
+                .small()
+                .weak(),
+            );
+
+            ui.add_space(8.0);
+            ui.heading("Rig");
+            ui.checkbox(&mut s.rig.restrict, "Restrict to plumbed ports")
+                .on_hover_text("Refuse to switch a valve to a port this rig does not have. Turn off to reach a capped line.");
+            ui.horizontal(|ui| {
+                ui.label("Fitted slots");
+                let mut slots = String::new();
+                for (i, n) in s.rig.slots.iter().enumerate() {
+                    if i > 0 {
+                        slots.push_str(", ");
+                    }
+                    slots.push_str(&n.to_string());
+                }
+                if ui
+                    .add(egui::TextEdit::singleline(&mut slots).desired_width(120.0).hint_text("e.g. 6"))
+                    .changed()
+                {
+                    s.rig.slots = slots
+                        .split(|c: char| !c.is_ascii_digit())
+                        .filter_map(|p| p.parse::<u16>().ok())
+                        .filter(|n| (1..=6).contains(n))
+                        .collect();
+                }
+
+                ui.label(
+                    RichText::new("slot numbers follow the diagram: SV02 port 16−n, SV03 port 7−n")
+                        .small()
+                        .weak(),
+                );
+            });
+            ui.label(RichText::new("Optical sensors — where each board channel sits on the diagram.").small().weak());
+            let mut drop_sensor: Option<usize> = None;
+            egui::Grid::new("rig_sensors").num_columns(4).spacing([10.0, 4.0]).show(ui, |ui| {
+                for (i, sensor) in s.rig.sensors.iter_mut().enumerate() {
+                    egui::ComboBox::from_id_salt(("rig_sensor_at", i))
+                        .selected_text(match sensor.at {
+                            SensorAt::Inline1 => "S1 · pump → coil",
+                            SensorAt::Inline2 => "S2 · coil → SV02",
+                            SensorAt::Slot => "slot feed",
+                        })
+                        .width(150.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut sensor.at, SensorAt::Inline1, "S1 · pump → coil");
+                            ui.selectable_value(&mut sensor.at, SensorAt::Inline2, "S2 · coil → SV02");
+                            ui.selectable_value(&mut sensor.at, SensorAt::Slot, "slot feed");
+                        });
+                    ui.add(egui::TextEdit::singleline(&mut sensor.name).desired_width(60.0).hint_text("A2"));
+                    ui.add(egui::DragValue::new(&mut sensor.channel).range(0..=5).prefix("channel "))
+                        .on_hover_text("Index into the board's six detectors, 0–5");
+                    if ui.button("Remove").clicked() {
+                        drop_sensor = Some(i);
+                    }
+                    ui.end_row();
+                }
+            });
+            if let Some(i) = drop_sensor {
+                s.rig.sensors.remove(i);
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Add sensor").clicked() {
+                    s.rig.sensors.push(Sensor { at: SensorAt::Slot, name: String::new(), channel: 0 });
+                }
+                ui.label("Board CAN id");
+                ui.add(
+                    egui::DragValue::new(&mut s.sensor_can_id)
+                        .range(0..=0x7FF)
+                        .hexadecimal(3, false, true)
+                        .prefix("0x"),
+                )
+                .on_hover_text("The firmware ships as 0x700; some builds assume 0x7FF.");
+            });
+
+            ui.add_space(6.0);
+            ui.label(RichText::new("Plumbed ports — anything not listed is treated as capped.").small().weak());
+            let mut remove: Option<usize> = None;
+            egui::Grid::new("rig_ports").num_columns(5).spacing([10.0, 4.0]).show(ui, |ui| {
+                for (i, use_) in s.rig.ports.iter_mut().enumerate() {
+                    egui::ComboBox::from_id_salt(("rig_valve", i))
+                        .selected_text(use_.valve.tag())
+                        .width(64.0)
+                        .show_ui(ui, |ui| {
+                            for v in [DeviceId::Sv01, DeviceId::Sv02, DeviceId::Sv03] {
+                                ui.selectable_value(&mut use_.valve, v, v.tag());
+                            }
+                        });
+                    let Kind::Valve { ports } = use_.valve.kind() else { return };
+                    ui.add(egui::DragValue::new(&mut use_.port).range(1..=ports).prefix("port "));
+                    ui.add(egui::TextEdit::singleline(&mut use_.label).desired_width(150.0).hint_text("label"));
+                    egui::ComboBox::from_id_salt(("rig_role", i))
+                        .selected_text(use_.role.label())
+                        .width(110.0)
+                        .show_ui(ui, |ui| {
+                            for r in [
+                                Role::Wash,
+                                Role::Reagent,
+                                Role::SlotFill,
+                                Role::SlotDrain,
+                                Role::Waste,
+                                Role::DangerWaste,
+                                Role::Air,
+                                Role::Other,
+                            ] {
+                                ui.selectable_value(&mut use_.role, r, r.label());
+                            }
+                        });
+                    if ui.button("Remove").clicked() {
+                        remove = Some(i);
+                    }
+                    ui.end_row();
+                }
+            });
+            if let Some(i) = remove {
+                s.rig.ports.remove(i);
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Add port").clicked() {
+                    s.rig.ports.push(PortUse { valve: DeviceId::Sv02, port: 1, label: String::new(), role: Role::Other });
+                }
+                if ui.button("This rig (defaults)").on_hover_text("One slot, wash, reagent, waste and air").clicked() {
+                    s.rig = Rig::default();
+                }
+                if ui.button("Whole diagram").on_hover_text("Six slots, every port, no guard").clicked() {
+                    s.rig = Rig::unrestricted();
+                }
+            });
+
+            ui.add_space(8.0);
             ui.heading("controller_v2 HTTP");
             ui.horizontal(|ui| {
                 ui.label("Address");
                 ui.text_edit_singleline(&mut s.controller_url);
             });
+            if remote {
+                ui.label(
+                    RichText::new(
+                        "Resolved on the server, which forwards these requests for this window — so 127.0.0.1 \
+                         here means the server's own loopback, where controller_v2 listens.",
+                    )
+                    .weak(),
+                );
+            }
             ui.checkbox(&mut s.poll_controller, "Read slot states (Idle / Missing / running step) from /slot-status every 2 s");
 
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if ui.button(RichText::new("Apply & save").strong()).clicked() {
-                    if self.draft.backend != self.settings.backend {
+                    if self.draft.effective_backend() != self.settings.effective_backend() {
                         self.tracker.flush();
-                        self.tracker = Tracker::for_backend(self.draft.backend);
+                        self.tracker = Tracker::for_backend(self.draft.effective_backend());
                     }
                     self.settings = self.draft.clone();
-                    self.bus.send(BusCmd::Apply(self.settings.clone()));
+                    self.bus.send(BusCmd::Apply(Box::new(self.settings.clone())));
                     self.settings_message = Some(match self.settings.save() {
                         Ok(()) => "Applied and saved.".to_string(),
                         Err(e) => format!("Applied, but saving failed: {e}"),
@@ -1432,16 +2179,50 @@ impl App {
     }
 }
 
+impl App {
+    /// A server tells each GUI what it is actually driving when they connect.
+    /// Take those fields over once per connection: the rig's port, addresses
+    /// and calibration belong to the machine holding the adapter, and another
+    /// operator may have set them since this window last saved anything.
+    fn adopt_server_settings(&mut self) {
+        let Some((generation, server)) = crate::remote::client::server_settings_since(self.adopted_server_settings)
+        else {
+            return;
+        };
+        self.adopted_server_settings = generation;
+        self.settings.adopt_server_fields(&server);
+        // Leave anything the user is part-way through editing alone.
+        if self.draft_matches_saved() {
+            self.draft.adopt_server_fields(&server);
+        }
+        self.available_ports = self.bus.serial_ports();
+        if self.tracker_backend != self.settings.effective_backend() {
+            self.tracker.flush();
+            self.tracker_backend = self.settings.effective_backend();
+            self.tracker = Tracker::for_backend(self.tracker_backend);
+        }
+    }
+
+    /// True while the Settings tab shows exactly what is in effect, so there
+    /// are no half-typed edits for the server's values to overwrite.
+    fn draft_matches_saved(&self) -> bool {
+        serde_json::to_string(&self.draft).ok() == serde_json::to_string(&self.settings).ok()
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_api();
+        self.adopt_server_settings();
         let state = self.bus.snapshot();
         if state.backend != Backend::Simulator {
             self.demo.clear();
             self.demo_wait = None;
         }
         self.step_demo(&state);
+        self.step_routine(&state);
         self.tracker.update(&state, &self.settings);
+        self.track_liquid(&state);
         if self.settings.poll_controller && self.last_slot_poll.is_none_or(|t| t.elapsed() > Duration::from_secs(2)) {
             self.api(Request::GetSlotStatus);
             self.last_slot_poll = Some(Instant::now());
@@ -1600,6 +2381,105 @@ fn trend(ui: &mut egui::Ui, history: &std::collections::VecDeque<(f64, f32)>, ma
     painter.text(rect.left_top() + egui::vec2(6.0, 4.0), egui::Align2::LEFT_TOP, "position, last 2 min", egui::FontId::proportional(10.0), visuals.weak_text_color());
 }
 
+/// Measured slot temperature against the target it was chasing.
+///
+/// Takes one board's trend rather than the whole state, so a second slot is
+/// another call rather than a redesign.
+fn temp_trend(ui: &mut egui::Ui, history: &VecDeque<TempSample>, now: f64, window: f64) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 96.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    let visuals = ui.visuals();
+    painter.rect_filled(rect, 4.0, visuals.extreme_bg_color);
+    let small = egui::FontId::proportional(10.0);
+    // A fixed span ending now. Scaling the axis to whatever has been collected
+    // makes a settling curve look the same shape after ten seconds as after
+    // ten minutes; a stable window lets the two be told apart, at the cost of
+    // a mostly-empty box for the first minute of a session.
+    let window = window.max(1.0);
+    let t0 = now - window;
+    let shown: Vec<&TempSample> = history.iter().filter(|s| s.t >= t0).collect();
+    let Some((lo, hi)) = trend_range(shown.iter().copied()) else {
+        painter.text(rect.center(), egui::Align2::CENTER_CENTER, "no samples yet", small, visuals.weak_text_color());
+        return;
+    };
+    // The corner labels get a band of their own at the top and bottom, and the
+    // traces stay out of it. Without that the target line — which sits near the
+    // top whenever the rig is heating — runs straight through the legend.
+    const LABELS: f32 = 13.0;
+    let plot = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 5.0, rect.top() + LABELS),
+        egui::pos2(rect.right() - 5.0, rect.bottom() - LABELS),
+    );
+    // `trend_range` never returns a zero-height band, so this cannot divide by
+    // zero even with the board holding dead steady.
+    let span = window;
+    let at = |t: f64, v: f32| {
+        let x = plot.right() - ((now - t) / span) as f32 * plot.width();
+        egui::pos2(x.max(plot.left()), plot.bottom() - (v - lo) / (hi - lo) * plot.height())
+    };
+
+    // The target first, so the measurement reads on top of it.
+    let target = Color32::from_rgb(60, 180, 90);
+    let mut runs: Vec<Vec<egui::Pos2>> = vec![Vec::new()];
+    for s in &shown {
+        match s.target {
+            Some(v) => runs.last_mut().expect("never empty").push(at(s.t, v)),
+            // No setpoint known is a hole in the trace, not a line across it.
+            None if !runs.last().expect("never empty").is_empty() => runs.push(Vec::new()),
+            None => {}
+        }
+    }
+    for run in &runs {
+        if run.len() >= 2 {
+            painter.extend(egui::Shape::dashed_line(run, egui::Stroke::new(1.3, target), 5.0, 4.0));
+        } else if let [p] = run[..] {
+            painter.circle_filled(p, 1.6, target);
+        }
+    }
+
+    let measured = Color32::from_rgb(64, 150, 240);
+    let pts: Vec<egui::Pos2> = shown.iter().map(|s| at(s.t, s.measured)).collect();
+    if pts.len() >= 2 {
+        painter.line(pts.clone(), egui::Stroke::new(1.8, measured));
+    } else if let [p] = pts[..] {
+        painter.circle_filled(p, 2.0, measured);
+    }
+
+    // One caption in the corner, like the pump's own trend box above. The two
+    // words are drawn in their trace's colour, which is the legend — a
+    // separate key would be more furniture for the same information.
+    let weak = visuals.weak_text_color();
+    let mut x = rect.left() + 6.0;
+    for (word, colour) in [("measured", measured), (" vs ", weak), ("target", target)] {
+        let at = egui::pos2(x, rect.top() + 3.0);
+        x = painter.text(at, egui::Align2::LEFT_TOP, word, small.clone(), colour).right();
+    }
+    painter.text(egui::pos2(x, rect.top() + 3.0), egui::Align2::LEFT_TOP, format!(", last {}", fmt_span(span)), small.clone(), weak);
+    // The scale goes on the right, clear of the caption.
+    painter.text(rect.right_top() + egui::vec2(-6.0, 3.0), egui::Align2::RIGHT_TOP, format!("{hi:.1} °C"), small.clone(), weak);
+    painter.text(rect.right_bottom() + egui::vec2(-6.0, -3.0), egui::Align2::RIGHT_BOTTOM, format!("{lo:.1} °C"), small, weak);
+
+    // Reading a ramp off the picture is guesswork; name the sample under the
+    // cursor instead.
+    if let Some(cursor) = response.hover_pos()
+        && let Some((i, _)) = pts
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| (a.x - cursor.x).abs().total_cmp(&(b.x - cursor.x).abs()))
+    {
+        let s = shown[i];
+        painter.line_segment([egui::pos2(pts[i].x, plot.top()), egui::pos2(pts[i].x, plot.bottom())], egui::Stroke::new(1.0, weak));
+        let target = s.target.map(|v| format!("{v:.2}")).unwrap_or_else(|| "—".into());
+        response.on_hover_text(format!("{:.2} °C · target {target} °C\n{} ago", s.measured, fmt_span(now - s.t)));
+    }
+}
+
+/// A rough age or width in time, for a label that only needs the order.
+fn fmt_span(secs: f64) -> String {
+    let secs = secs.max(0.0);
+    if secs >= 90.0 { format!("{:.0} min", secs / 60.0) } else { format!("{secs:.0} s") }
+}
+
 fn json_num(v: &serde_json::Value, key: &str) -> String {
     v.get(key).map(|x| x.to_string()).unwrap_or_else(|| "?".into())
 }
@@ -1627,8 +2507,57 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// The band the rig works in. The Peltier can go further, but a setpoint
+/// outside this is far more likely to be a typo than an intent.
+const TEMP_MIN_C: f32 = 4.0;
+const TEMP_MAX_C: f32 = 95.0;
+/// How far back the temperature trend is drawn. Matches the ring the workers
+/// keep, so the plot shows everything there is rather than a window inside it.
+const TEMP_TREND_SECS: f64 = 600.0;
+
+fn temp_status_color(status: TempStatus) -> Color32 {
+    match status {
+        TempStatus::Off => Color32::from_rgb(110, 115, 125),
+        TempStatus::Offline => Color32::from_rgb(220, 70, 70),
+        TempStatus::Fault => Color32::from_rgb(225, 80, 80),
+        TempStatus::Idle => Color32::from_rgb(140, 150, 165),
+        TempStatus::Driving => Color32::from_rgb(64, 150, 240),
+        TempStatus::Holding => Color32::from_rgb(60, 180, 90),
+    }
+}
+
 fn list_ports() -> Vec<String> {
-    serialport::available_ports()
-        .map(|ports| ports.into_iter().map(|p| p.port_name).collect())
-        .unwrap_or_default()
+    crate::remote::server::list_ports()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The painter path is easy to break with a slice index or a division by a
+    /// zero-width span; run it headless over the shapes it has to survive.
+    #[test]
+    fn the_trend_draws_every_shape_of_history() {
+        let sample = |t: f64, measured: f32, target: Option<f32>| TempSample { t, measured, target };
+        let cases: Vec<VecDeque<TempSample>> = vec![
+            VecDeque::new(),
+            VecDeque::from(vec![sample(0.0, 21.0, None)]),
+            VecDeque::from(vec![sample(0.0, 37.0, Some(37.0)), sample(1.0, 37.0, Some(37.0))]),
+            // A target that appears, goes away and comes back: three traces
+            // with holes, and a measurement that spans them.
+            VecDeque::from(vec![
+                sample(0.0, 21.0, None),
+                sample(30.0, 25.0, Some(60.0)),
+                sample(60.0, 40.0, None),
+                sample(90.0, 55.0, Some(60.0)),
+            ]),
+        ];
+        for history in &cases {
+            // Both ends of the window selector, and a degenerate one, so a
+            // fixed span cannot divide by zero or invert the axis.
+            for window in [300.0, 600.0, 0.0] {
+                egui::__run_test_ui(|ui| temp_trend(ui, history, 120.0, window));
+            }
+        }
+    }
 }

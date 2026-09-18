@@ -1,12 +1,14 @@
 //! Client for controller_v2's HTTP API — the same packets `signal_sender`
 //! builds on the command line, sent from a background thread.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Sender, channel};
 use std::thread;
 use std::time::Duration;
+
+use crate::bus::Wake;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommandKind {
@@ -49,7 +51,7 @@ pub const PAUSE_ALL: u16 = 14;
 pub const RESUME_ALL: u16 = 15;
 pub const ABORT_ALL: u16 = 16;
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SingleCommand {
     pub command_type: u16,
     pub temperature: f64,
@@ -74,7 +76,7 @@ impl SingleCommand {
     }
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Packet {
     pub slot_id: u16,
     pub commands: Vec<SingleCommand>,
@@ -82,7 +84,7 @@ pub struct Packet {
     pub requested_start_ts_ms: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Request {
     PostData(Packet),
     EstimateTime(Packet),
@@ -93,7 +95,7 @@ pub enum Request {
 }
 
 impl Request {
-    fn describe(&self) -> String {
+    pub fn describe(&self) -> String {
         match self {
             Request::PostData(p) => format!("POST /data task {} slot {}", p.task_id, p.slot_id),
             Request::EstimateTime(p) => format!("POST /estimated-protocol-time slot {}", p.slot_id),
@@ -117,20 +119,24 @@ pub struct Reply {
     pub result: Result<(u16, String), String>,
 }
 
-pub fn spawn(ctx: eframe::egui::Context) -> (Sender<(String, Request)>, Receiver<Reply>) {
+/// Background HTTP worker for the direct route: the controller is reachable
+/// from this machine. Replies go to `reply_tx`, which the bus shares with the
+/// tunnelled route so the front end reads one channel either way.
+pub fn spawn_direct(wake: Wake, reply_tx: Sender<Reply>) -> Sender<(String, Request)> {
     let (tx, rx) = channel::<(String, Request)>();
-    let (reply_tx, reply_rx) = channel::<Reply>();
     thread::spawn(move || {
         for (host, request) in rx {
             let result = execute(&host, &request);
             let _ = reply_tx.send(Reply { summary: request.describe(), request, result });
-            ctx.request_repaint();
+            wake.call();
         }
     });
-    (tx, reply_rx)
+    tx
 }
 
-fn execute(host: &str, request: &Request) -> Result<(u16, String), String> {
+/// Runs one request against `host`. Public because `tstand_server` calls it to
+/// forward what a remote GUI could not reach itself.
+pub fn execute(host: &str, request: &Request) -> Result<(u16, String), String> {
     match request {
         Request::PostData(p) => http(host, "POST", "/data", Some(json(p)?)),
         Request::EstimateTime(p) => http(host, "POST", "/estimated-protocol-time", Some(json(p)?)),

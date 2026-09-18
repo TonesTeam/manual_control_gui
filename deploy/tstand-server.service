@@ -1,0 +1,46 @@
+[Unit]
+Description=Tones liquid processing control server
+Documentation=https://github.com/VanekGer/manual_control_gui
+# The RS485 adapter must be present; without it the server exits rather than
+# pretending the rig is there.
+After=network-online.target dev-ttyUSB0.device
+Wants=network-online.target
+BindsTo=dev-ttyUSB0.device
+
+[Service]
+Type=simple
+User=rpi
+# The user must be in the `dialout` group to open /dev/ttyUSB0.
+SupplementaryGroups=dialout
+WorkingDirectory=/home/rpi/manual_control_gui
+ExecStart=/home/rpi/manual_control_gui/target/release/tstand_server \
+    --bind 0.0.0.0:7373 \
+    --port /dev/ttyUSB0 \
+    --controller 127.0.0.1:3000
+
+# The shared secret every GUI must send. Keep it out of the unit file:
+#   sudo install -m 600 -o root -g root /dev/null /etc/tstand-server.env
+#   echo 'TSTAND_TOKEN=pick-something' | sudo tee /etc/tstand-server.env
+EnvironmentFile=-/etc/tstand-server.env
+
+# A crash must not leave the pumps unattended for long.
+Restart=always
+RestartSec=2
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tstand-server
+
+# It needs one serial port and one socket, nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/rpi/manual_control_gui
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
