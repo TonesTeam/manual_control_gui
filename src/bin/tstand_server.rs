@@ -24,6 +24,12 @@ OPTIONS:
                          $TSTAND_TOKEN. Empty means no authentication.
     --port <DEV>         Serial port for the RS485 adapter, e.g. /dev/ttyUSB0
     --baud <RATE>        Serial baud rate [default: from saved settings]
+    --can-port <DEV>     Serial port for the WeAct USB2CAN adapter (temperature
+                         board and liquid sensors), e.g.
+                         /dev/serial/by-id/usb-WeAct_Studio_USB2CANV1_...
+                         Turns the CAN link on. [default: from saved
+                         settings; blank there auto-detects a WeAct]
+    --no-can             Leave the CAN adapter closed for this run
     --simulator          Run the built-in simulator instead of the adapter
     --controller <ADDR>  controller_v2's HTTP address, reached from here
                          [default: 127.0.0.1:3000]
@@ -90,6 +96,11 @@ fn run() -> Result<(), String> {
                 let raw = value("--baud")?;
                 settings.baud_rate = raw.parse().map_err(|_| format!("bad baud rate '{raw}'"))?;
             }
+            "--can-port" => {
+                settings.temp_port = value("--can-port")?;
+                settings.temp_enabled = true;
+            }
+            "--no-can" => settings.temp_enabled = false,
             "--simulator" => settings.backend = Backend::Simulator,
             other => return Err(format!("unknown option '{other}'\n\n{USAGE}")),
         }

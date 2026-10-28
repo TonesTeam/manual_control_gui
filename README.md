@@ -109,7 +109,7 @@ On Windows PowerShell, set it first with `$env:TSTAND_RENDERER="glow"`.
 
 ### Prebuilt binaries
 
-Every push runs `.github/workflows/build.yml`, which tests and builds release binaries for Windows, macOS (Apple Silicon and Intel) and Linux, plus `tstand_server` cross-built for 64-bit ARM Linux — the Raspberry Pi build, ready to copy to the rig. The binaries are attached to the workflow run as artifacts.
+Every push runs `.github/workflows/build.yml`, which tests and builds release binaries for Windows, macOS (Apple Silicon and Intel) and Linux, plus `tstand_server` cross-built for 64-bit ARM Linux without the temperature board. For the rig itself use `make pi`, which includes it. The binaries are attached to the workflow run as artifacts.
 
 The program starts with the **Simulator** backend, which needs no hardware and follows datasheet timing. To use real hardware, go to Settings, choose *RS485 serial*, pick the port and click **Apply & save**. It may be necessary to home components before other commands work.
 
@@ -136,37 +136,46 @@ Several GUIs can watch one rig at once. They all see the same state, because the
 
 ### On the rig's computer
 
-Install Rust from <https://rustup.rs>, then build just the server. It needs no display libraries:
+The Pi runs binaries only. Nothing is compiled there, so it needs no Rust, no source and no build folders. Both programs are cross-compiled on the PC inside Docker (or Podman), in a Debian 12 image that matches Raspberry Pi OS, and uploaded to `~/tstand` on the Pi:
 
 ```sh
-cargo build --release --no-default-features --features can --bin tstand_server
-./target/release/tstand_server --port /dev/ttyUSB0 --token pick-something
+make pi         # cross-compile tstand_server and controller_v2 into deploy/out/
+make deploy     # ...then upload them and restart the Pi's services
+make status     # what is running there, and whether it starts at boot
+make logs       # follow both services' logs
+make help       # the rest
 ```
 
-Keep `--no-default-features`: a bare `cargo run --bin tstand_server` also builds the GUI's egui, which needs a newer Rust and the display libraries the Pi doesn't have.
+controller_v2 is built from GitHub `master`; `CONTROLLER_SRC=/path/to/controller_v2 make pi` builds a local checkout instead. Private dependencies (the temperature and sensor crates) are downloaded on the PC with your own git credentials, and the container builds offline, so neither the container nor the Pi needs a GitHub key.
 
-`--features can` adds the temperature board; it needs libudev (`libudev-dev` on Debian, already present with systemd). Leave it out for a server that only drives RS485.
+To try it by hand on the Pi:
 
-`--list-ports` prints the serial ports it can see. `--simulator` runs the built-in simulator instead of the adapter, which is enough to try a GUI against it. `--help` lists the rest.
+```sh
+~/tstand/tstand_server --port /dev/ttyUSB0 --token pick-something
+```
+
+`--can-port <DEV>` names the WeAct CAN adapter (temperature board and liquid sensors) and turns that link on; `--no-can` leaves it closed. The boot service names both adapters by paths that survive re-enumeration: the RS485 CH340 by the USB socket it is in (`/dev/serial/by-path/…`, because the rig has two identical CH340s), the WeAct by its serial number (`/dev/serial/by-id/…`). `--list-ports` prints the serial ports it can see. `--simulator` runs the built-in simulator instead of the adapter, which is enough to try a GUI against it. `--help` lists the rest.
+
+Building the server on the machine itself still works (`make server`, or `cargo build --release --no-default-features --features can --bin tstand_server`). Keep `--no-default-features`: without it, cargo builds the GUI's egui too, which needs Rust 1.92 and display libraries.
 
 ### Launching at boot
 
-`deploy/deploy.sh` can install `tstand_server` and controller_v2 as systemd services on the Pi, so they start on their own when it boots. Pick what runs:
+Pick what starts by itself when the Pi boots:
 
 ```sh
-deploy/deploy.sh --autostart              # both
-deploy/deploy.sh --autostart server       # only tstand_server
-deploy/deploy.sh --autostart controller   # only controller_v2
-deploy/deploy.sh --no-autostart [server|controller]   # stop launching at boot
+make autostart-server       # tstand_server
+make autostart-controller   # controller_v2
+make autostart-both         # both: read the warning below first
+make no-autostart           # neither (deploy/deploy.sh --no-autostart server|controller for one)
 ```
 
-Each run syncs the code to the Pi, builds it there, installs and enables the unit (`deploy/tstand-server.service`, `deploy/controller-v2.service`) and restarts it. After that, `deploy/deploy.sh` with no options syncs, rebuilds and restarts whatever is installed. `--install-service` still works and means `--autostart server`.
+Each one builds, uploads, installs and enables the unit (`deploy/tstand-server.service`, `deploy/controller-v2.service`) and restarts it. Afterwards `make deploy` keeps whatever is installed up to date.
 
 - **Token:** put it in `/etc/tstand-server.env` (`TSTAND_TOKEN=...`); the server's unit reads it from there.
-- **controller_v2 source:** taken from a `controller_v2` checkout next to this one, or from `CONTROLLER_SRC=/path/to/controller_v2`. It depends on the private `optical-sensor-can` repository, so the build on the Pi borrows your SSH agent to fetch it. Your GitHub key must be loaded (`ssh-add -l`). Or cross-build it and pass `CONTROLLER_BIN=path/to/controller_v2` to upload the binary instead.
-- **Logs:** `journalctl -u tstand-server -f` and `journalctl -u controller-v2 -f`.
+- **State:** `tstand_server.json` and the level and fluidics files are kept in `~/tstand`, next to the binary.
+- **Logs:** `make logs`, or `journalctl -u tstand-server -u controller-v2 -f` on the Pi.
 
-**Running both is safe until controller_v2 is initialised.** At startup controller_v2 only listens on `127.0.0.1:3000`. It opens `/dev/ttyUSB0` and the CAN adapter only when something POSTs `/initialize`. While `tstand_server` holds the adapters, that open fails, so before running a protocol through controller_v2, stop the server first (`sudo systemctl stop tstand-server`).
+**controller_v2 moves the rig as it starts.** At startup it looks for the RS485 adapter and the WeAct CAN adapter, and when it finds both it opens them and queues its initialisation sequence, so the pumps and valves move. Started alongside `tstand_server`, the two contend for the same adapters. So pick one to own the rig at boot. Starting both is possible (`make autostart-both`), but then neither is guaranteed the bus.
 
 The user it runs as must be in the `dialout` group to open `/dev/ttyUSB0`.
 

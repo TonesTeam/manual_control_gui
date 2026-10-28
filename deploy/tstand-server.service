@@ -1,21 +1,28 @@
 [Unit]
 Description=Tones liquid processing control server
 Documentation=https://github.com/VanekGer/manual_control_gui
-# The RS485 adapter must be present; without it the server exits rather than
-# pretending the rig is there.
-After=network-online.target dev-ttyUSB0.device
+# The RS485 adapter is named by the USB socket it is plugged into, not by
+# ttyUSBn: there are two identical CH340s on this rig, and Linux numbers them
+# in whatever order they enumerate. If the adapter is missing the server exits
+# and Restart= tries again every 2 s, so replugging it brings the server back.
+# The CAN adapter has a serial number of its own, so it is named by that
+# (by-id) and follows the adapter to any socket.
+After=network-online.target
 Wants=network-online.target
-BindsTo=dev-ttyUSB0.device
+# Keep retrying however long the adapter is unplugged.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 User=rpi
-# The user must be in the `dialout` group to open /dev/ttyUSB0.
+# The user must be in the `dialout` group to open the serial ports.
 SupplementaryGroups=dialout
-WorkingDirectory=/home/rpi/manual_control_gui
-ExecStart=/home/rpi/manual_control_gui/target/release/tstand_server \
+# Cross-compiled on the PC and uploaded by deploy/deploy.sh (make deploy).
+WorkingDirectory=/home/rpi/tstand
+ExecStart=/home/rpi/tstand/tstand_server \
     --bind 0.0.0.0:7373 \
-    --port /dev/ttyUSB0 \
+    --port /dev/serial/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.2.1:1.0-port0 \
+    --can-port /dev/serial/by-id/usb-WeAct_Studio_USB2CANV1_ComPort_AAAE20863660-if00 \
     --controller 127.0.0.1:3000
 
 # The shared secret every GUI must send. Keep it out of the unit file:
@@ -36,7 +43,8 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
-ReadWritePaths=/home/rpi/manual_control_gui
+# tstand_server.json and the level/fluidics state sit next to the binary.
+ReadWritePaths=/home/rpi/tstand
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictNamespaces=true

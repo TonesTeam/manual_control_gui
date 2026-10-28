@@ -32,7 +32,7 @@ ssh rpi@tonespi.local
 cd manual_control_gui && ./target/release/tstand_server --port /dev/ttyUSB0 --token <secret>
 ```
 
-*(Since then: `deploy/deploy.sh --autostart [server|controller]` launches either or both at boot — see the README.)*
+*(Since then: nothing is built on the Pi any more. `make pi` cross-compiles both programs on the PC, `make deploy` uploads them to `~/tstand`, and `make autostart-server` (or `-controller`, `-both`) launches them at boot — see the README.)*
 
 It was **not** a boot service, which is why it did not come back after the Pi
 rebooted mid-session. `deploy/deploy.sh --install-service` installs one; the

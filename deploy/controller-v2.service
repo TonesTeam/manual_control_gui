@@ -1,10 +1,10 @@
 [Unit]
 Description=Tones controller_v2 protocol server
 Documentation=https://github.com/TonesTeam/controller_v2
-# controller_v2 opens no adapter at startup: it serves HTTP on 127.0.0.1:3000
-# and only takes /dev/ttyUSB0 and the CAN adapter when something POSTs
-# /initialize. So it can start at boot alongside tstand-server; the two only
-# collide if it is initialised while tstand-server holds the bus.
+# controller_v2 looks for the RS485 (USB_Serial) and WeAct CAN adapters as it
+# starts. When it finds both it opens them and queues its initialisation
+# sequence, so the pumps and valves move at boot. Don't enable this together
+# with tstand-server unless that is what you want: the two contend for the bus.
 After=network-online.target
 Wants=network-online.target
 
@@ -13,8 +13,9 @@ Type=simple
 User=rpi
 # Needed once it is initialised and opens the serial ports.
 SupplementaryGroups=dialout
-WorkingDirectory=/home/rpi/controller_v2
-ExecStart=/home/rpi/controller_v2/target/release/controller_v2
+# Cross-compiled on the PC and uploaded by deploy/deploy.sh (make deploy).
+WorkingDirectory=/home/rpi/tstand
+ExecStart=/home/rpi/tstand/controller_v2
 
 Restart=always
 RestartSec=2
