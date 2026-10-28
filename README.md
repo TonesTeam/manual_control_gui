@@ -60,7 +60,7 @@ The optical liquid sensors are on the same CAN adapter. One board carries six fi
 
 ## Building and running
 
-Runs on Windows, macOS and Linux (x86_64 and ARM). Install Rust 1.92 or newer from <https://rustup.rs>, then:
+Runs on Windows, macOS and Linux (x86_64 and ARM). Install Rust from <https://rustup.rs> — 1.92 or newer for the GUI (egui 0.35 needs it), 1.88 is enough for `tstand_server` — then:
 
 ```sh
 cargo run --release
