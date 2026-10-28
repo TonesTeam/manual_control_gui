@@ -32,7 +32,9 @@ ssh rpi@tonespi.local
 cd manual_control_gui && ./target/release/tstand_server --port /dev/ttyUSB0 --token <secret>
 ```
 
-It is **not** a boot service, which is why it did not come back after the Pi
+*(Since then: `deploy/deploy.sh --autostart [server|controller]` launches either or both at boot — see the README.)*
+
+It was **not** a boot service, which is why it did not come back after the Pi
 rebooted mid-session. `deploy/deploy.sh --install-service` installs one; the
 reason it has not been done is that it would then own the RS485 bus at boot and
 controller_v2 could not use it.

@@ -1,0 +1,37 @@
+[Unit]
+Description=Tones controller_v2 protocol server
+Documentation=https://github.com/TonesTeam/controller_v2
+# controller_v2 opens no adapter at startup: it serves HTTP on 127.0.0.1:3000
+# and only takes /dev/ttyUSB0 and the CAN adapter when something POSTs
+# /initialize. So it can start at boot alongside tstand-server; the two only
+# collide if it is initialised while tstand-server holds the bus.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rpi
+# Needed once it is initialised and opens the serial ports.
+SupplementaryGroups=dialout
+WorkingDirectory=/home/rpi/controller_v2
+ExecStart=/home/rpi/controller_v2/target/release/controller_v2
+
+Restart=always
+RestartSec=2
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=controller-v2
+
+# It writes no files: serial ports, loopback HTTP and Moonraker on :7125.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

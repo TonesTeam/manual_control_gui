@@ -147,13 +147,24 @@ cargo build --release --no-default-features --features can --bin tstand_server
 
 `--list-ports` prints the serial ports it can see. `--simulator` runs the built-in simulator instead of the adapter, which is enough to try a GUI against it. `--help` lists the rest.
 
-To keep it running across reboots, install the systemd unit:
+### Launching at boot
+
+`deploy/deploy.sh` can install `tstand_server` and controller_v2 as systemd services on the Pi, so they start on their own when it boots. Pick what runs:
 
 ```sh
-deploy/deploy.sh --install-service
+deploy/deploy.sh --autostart              # both
+deploy/deploy.sh --autostart server       # only tstand_server
+deploy/deploy.sh --autostart controller   # only controller_v2
+deploy/deploy.sh --no-autostart [server|controller]   # stop launching at boot
 ```
 
-That syncs this checkout to the rig, builds it there, installs `deploy/tstand-server.service` and starts it. Put the token in `/etc/tstand-server.env` (`TSTAND_TOKEN=...`), which the unit reads. Afterwards `deploy/deploy.sh` alone syncs, rebuilds and restarts. `journalctl -u tstand-server -f` follows its log.
+Each run syncs the code to the Pi, builds it there, installs and enables the unit (`deploy/tstand-server.service`, `deploy/controller-v2.service`) and restarts it. After that, `deploy/deploy.sh` with no options syncs, rebuilds and restarts whatever is installed. `--install-service` still works and means `--autostart server`.
+
+- **Token:** put it in `/etc/tstand-server.env` (`TSTAND_TOKEN=...`); the server's unit reads it from there.
+- **controller_v2 source:** taken from a `controller_v2` checkout next to this one, or from `CONTROLLER_SRC=/path/to/controller_v2`. It depends on the private `optical-sensor-can` repository, so the build on the Pi borrows your SSH agent to fetch it. Your GitHub key must be loaded (`ssh-add -l`). Or cross-build it and pass `CONTROLLER_BIN=path/to/controller_v2` to upload the binary instead.
+- **Logs:** `journalctl -u tstand-server -f` and `journalctl -u controller-v2 -f`.
+
+**Running both is safe until controller_v2 is initialised.** At startup controller_v2 only listens on `127.0.0.1:3000`. It opens `/dev/ttyUSB0` and the CAN adapter only when something POSTs `/initialize`. While `tstand_server` holds the adapters, that open fails, so before running a protocol through controller_v2, stop the server first (`sudo systemctl stop tstand-server`).
 
 The user it runs as must be in the `dialout` group to open `/dev/ttyUSB0`.
 
