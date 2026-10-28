@@ -60,7 +60,7 @@ The optical liquid sensors are on the same CAN adapter. One board carries six fi
 
 ## Building and running
 
-Runs on Windows, macOS and Linux (x86_64 and ARM). Install Rust 1.88 or newer from <https://rustup.rs>, then:
+Runs on Windows, macOS and Linux (x86_64 and ARM). Install Rust 1.92 or newer from <https://rustup.rs>, then:
 
 ```sh
 cargo run --release
@@ -142,6 +142,8 @@ Install Rust from <https://rustup.rs>, then build just the server. It needs no d
 cargo build --release --no-default-features --features can --bin tstand_server
 ./target/release/tstand_server --port /dev/ttyUSB0 --token pick-something
 ```
+
+Keep `--no-default-features`: a bare `cargo run --bin tstand_server` also builds the GUI's egui, which needs a newer Rust and the display libraries the Pi doesn't have.
 
 `--features can` adds the temperature board; it needs libudev (`libudev-dev` on Debian, already present with systemd). Leave it out for a server that only drives RS485.
 
